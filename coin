@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4617157719')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4946614597')
 # 確認 Token & Chat ID
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定！請檢查 .env 檔")
