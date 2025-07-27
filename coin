@@ -23,6 +23,10 @@ logging.basicConfig(
 # ========== 參數設定 ==========
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4617157719')
+# 確認 Token & Chat ID
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logging.error("TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定！請檢查 .env 檔")
+    sys.exit(1)
 
 # ========== 初始化交易所 ==========
 exchanges = {
@@ -56,13 +60,7 @@ def get_binance_futures_symbols_via_requests():
         return []
 
 symbols = get_binance_futures_symbols_via_requests()
-print(f"總共偵測到 {len(symbols)} 個幣種")
-symbols = get_binance_futures_symbols_via_requests()
-message = f"總共偵測到 {len(symbols)} 個幣種"
-# 送到 Telegram 群組
-send_alert(message)
-# （如果還想在 console 顯示）
-print(message)
+
 ############################
 # ========== 直接用 requests 取得 Binance 期貨 USDT 交易對清單 ==========
 def get_binance_futures_symbols_via_requests():
@@ -201,5 +199,13 @@ def main():
         if elapsed < 60:
             time.sleep(60 - elapsed)
 
+# ========== 程式啟動 ==========
 if __name__ == "__main__":
-    main() 
+    # 初始測試訊息
+    syms = get_binance_futures_symbols_via_requests()
+    init_msg = f"總共偵測到 {len(syms)} 個幣種"
+    print(init_msg)
+    send_alert(init_msg)
+
+    # 啟動監控主循環
+    main()
