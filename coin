@@ -102,42 +102,48 @@ PRICE_TIERS = [(5.0,'⭐⭐⭐⭐'),(4.0,'⭐⭐⭐'),(3.0,'⭐⭐'),(2.0,'⭐')
 OI_TIERS    = [(5.0,'🔥🔥🔥🔥'),(3.5,'🔥🔥🔥'),(3.0,'🔥🔥'),(2.5,'🔥')]
 
 # ========== 格式化並發送報文 ==========
-def format_and_send(symbol, spot_hist, fut_hist):
+# ========== 格式化並發送報文 ==========
+def format_and_send(symbol, spot_hist, fut_hist, best_ex_id, timeframe):
+    # 計算百分比變動
     def pct(arr, mins):
         cutoff = datetime.utcnow() - timedelta(minutes=mins)
-        old = next((v for (t,v) in arr if t <= cutoff), None)
+        old = next((v for (t, v) in arr if t <= cutoff), None)
         new = arr[-1][1] if arr else None
-        return ((new-old)/old*100) if (old and new is not None) else 0.0
+        return ((new - old) / old * 100) if (old and new is not None) else 0.0
 
-    p1,p5,p15 = pct(spot_hist,1), pct(spot_hist,5), pct(spot_hist,15)
-    o1,o5,o15 = pct(fut_hist,1), pct(fut_hist,5), pct(fut_hist,15)
+    p1, p5, p15 = pct(spot_hist, 1), pct(spot_hist, 5), pct(spot_hist, 15)
+    o1, o5, o15 = pct(fut_hist, 1), pct(fut_hist, 5), pct(fut_hist, 15)
 
-    price_alert = max(abs(p1),abs(p5),abs(p15)) >= PRICE_TIERS[-1][0]
-    oi_alert    = max(abs(o1),abs(o5),abs(o15)) >= OI_TIERS[-1][0]
+    price_alert = max(abs(p1), abs(p5), abs(p15)) >= PRICE_TIERS[-1][0]
+    oi_alert    = max(abs(o1), abs(o5), abs(o15)) >= OI_TIERS[-1][0]
     if not price_alert and not oi_alert:
         return
 
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [f"🛰️ Ashdata標的監控\n交易對：{symbol}"]
-
+    # 1️⃣ 第一段：標題
     if price_alert:
-        stars = next(r for th,r in PRICE_TIERS if abs(p1)>=th or abs(p5)>=th or abs(p15)>=th)
-        lines += [
-            f"📈 價格異動 {stars}",
-            f" • 1m: {p1:+.2f}% 5m: {p5:+.2f}% 15m: {p15:+.2f}%"
-        ]
+        stars = next(r for th, r in PRICE_TIERS if abs(p1) >= th or abs(p5) >= th or abs(p15) >= th)
+        header = f"📈 價格異動 {stars}評級"
+    else:
+        fires = next(r for th, r in OI_TIERS if abs(o1) >= th or abs(o5) >= th or abs(o15) >= th)
+        cor   = (p1 * o1 > 0 and p5 * o5 > 0 and p15 * o15 > 0)
+        note  = "" if cor else " ⚠️疑是空方進場"
+        header = f"💹 持倉異動 {fires}{note}"
+
+    # 2️⃣ 第二段：交易所 + 交易對
+    pair_line = f"{best_ex_id}:{symbol.replace('/', '')}"
+
+    # 3️⃣ 第三段：Timeframe
+    tf_line = f"Timeframe: {timeframe}"
+
+    # 細節行
+    lines = [header, pair_line, tf_line]
+    if price_alert:
+        lines.append(f" • 1m: {p1:+.2f}% 5m: {p5:+.2f}% 15m: {p15:+.2f}%")
     if oi_alert:
-        fires = next(r for th,r in OI_TIERS if abs(o1)>=th or abs(o5)>=th or abs(o15)>=th)
-        cor = (p1*o1>0 and p5*o5>0 and p15*o15>0)
-        note = "" if cor else " ⚠️疑是空方進場"
-        lines += [
-            f"💹 持倉異動 {fires}{note}",
-            f" • 1m: {o1:+.2f}% 5m: {o5:+.2f}% 15m: {o15:+.2f}%"
-        ]
+        lines.append(f" • 1m: {o1:+.2f}% 5m: {o5:+.2f}% 15m: {o15:+.2f}%")
 
-    lines.append(f"時間：{now}")
+    lines.append(f"時間：{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
     send_alert("\n".join(lines))
-
 
 # ========== 歷史資料儲存 ==========
 history = {}  # {symbol: {'spot': [(timestamp, price, volume)], 'futures': [(timestamp, open_interest)]}}
@@ -145,47 +151,69 @@ history = {}  # {symbol: {'spot': [(timestamp, price, volume)], 'futures': [(tim
 # ========== 主循環 ==========
 # ========== 主程式 ==========
 def main():
-    syms = get_binance_futures_symbols_via_requests()
-    if not syms:
+    all_syms = get_binance_futures_symbols_via_requests()
+    if not all_syms:
         logging.error("無期貨合約可監控，程式結束")
         return
 
-    # 啟動時僅發送一次
-    init_msg = f"🛰️ Ashdata監控啟動：共偵測到 {len(syms)} 個合約"
+    # 過濾出至少一個現貨交易所支援的合約
+    potential_syms = []
+    for sym in all_syms:
+        spot_sym = f"{sym.split('/')[0]}/USDT"
+        if any(spot_sym in ex.markets for ex in exchanges.values()):
+            potential_syms.append(sym)
+        else:
+            logging.info(f"{sym} 無現貨市場支援，跳過")
+
+    if not potential_syms:
+        logging.error("經過過濾後，沒有任何可監控的合約")
+        return
+
+    # 先發潛在名單前 20 筆到 Telegram
+    sample = potential_syms[:20]
+    notice = (
+        f"🛰️ Ashdata 潛在監控名單（示例前20筆，共{len(potential_syms)}）：\n"
+        + "\n".join(sample)
+    )
+    logging.info(notice)
+    send_alert(notice)
+
+    # 啟動通知
+    init_msg = f"🛰️ Ashdata監控啟動：共偵測到 {len(potential_syms)} 個可監控合約"
     logging.info(init_msg)
     send_alert(init_msg)
 
-    # 建立歷史結構
-    history = {s:{'spot':deque(), 'futures':deque()} for s in syms}
+    # 建立歷史資料結構
+    history = {s: {'spot': deque(), 'futures': deque()} for s in potential_syms}
 
     while True:
-        loop_start = time.time()
-        for symbol in syms:
-            base = symbol.split('/')[0]
+        start = time.time()
+        for symbol in potential_syms:
+            base     = symbol.split('/')[0]
             spot_sym = f"{base}/USDT"
 
-            # 選成交量最大交易所
+            # 選成交量最大現貨交易所
             best_ex, maxv = None, 0.0
             for ex in exchanges.values():
                 if spot_sym not in ex.markets:
                     continue
                 try:
-                    qv = ex.fetch_ticker(spot_sym).get('quoteVolume',0) or 0
-                    if qv > maxv:
-                        best_ex, maxv = ex, qv
+                    vol = ex.fetch_ticker(spot_sym).get('quoteVolume', 0) or 0
+                    if vol > maxv:
+                        best_ex, maxv = ex, vol
                 except:
                     continue
             if not best_ex:
                 continue
 
-            # 抓 1m 收盤價
+            # 抓 1 分鐘 OHLCV 收盤價
             try:
-                ohlcv = best_ex.fetch_ohlcv(spot_sym,'1m',limit=2)
+                ohlcv = best_ex.fetch_ohlcv(spot_sym, '1m', limit=2)
                 prev, curr = ohlcv[-2][4], ohlcv[-1][4]
             except:
                 continue
 
-            # 抓期貨 OI
+            # 抓期貨持倉量
             try:
                 curr_oi = float(binance_futures.fetch_open_interest(symbol)['openInterest'])
             except:
@@ -193,20 +221,22 @@ def main():
 
             now = datetime.utcnow()
             sh, fh = history[symbol]['spot'], history[symbol]['futures']
-            sh.append((now, curr)); fh.append((now, curr_oi))
+            sh.append((now, curr))
+            fh.append((now, curr_oi))
 
-            # 保留最近 15 分鐘
+            # 保留最近 15 分鐘資料
             cutoff = now - timedelta(minutes=15)
-            history[symbol]['spot']   = [(t,v) for t,v in sh if t>=cutoff]
-            history[symbol]['futures'] = [(t,v) for t,v in fh if t>=cutoff]
+            history[symbol]['spot']   = [(t, v) for t, v in sh if t >= cutoff]
+            history[symbol]['futures'] = [(t, v) for t, v in fh if t >= cutoff]
 
-            # 格式化並通知
-            format_and_send(symbol, history[symbol]['spot'], history[symbol]['futures'])
+            # 格式化並發送警報
+            format_and_send(symbol, history[symbol]['spot'],
+                            history[symbol]['futures'],
+                            best_ex.id, '1m')
 
             time.sleep(0.2)
 
-        # 1 分鐘間隔
-        elapsed = time.time() - loop_start
+        elapsed = time.time() - start
         if elapsed < 60:
             time.sleep(60 - elapsed)
 
