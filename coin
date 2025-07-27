@@ -3,10 +3,9 @@ import sys
 import time
 import logging
 import requests
+# ========== 載入環境變數 ==========
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-# ========== 自動安裝 ccxt ==========
-# ========== 載入環境變數 ==========
 load_dotenv()
 try:
     import ccxt
