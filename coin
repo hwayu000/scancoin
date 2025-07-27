@@ -4,8 +4,10 @@ import time
 import logging
 import requests
 from datetime import datetime, timedelta
-
+from dotenv import load_dotenv
 # ========== 自動安裝 ccxt ==========
+# ========== 載入環境變數 ==========
+load_dotenv()
 try:
     import ccxt
 except ImportError:
@@ -21,6 +23,11 @@ logging.basicConfig(
 )
 
 # ========== 參數設定 ==========
+
+# ========== 載入環境變數 ==========
+from dotenv import load_dotenv
+load_dotenv()
+
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4617157719')
 # 確認 Token & Chat ID
