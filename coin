@@ -3,9 +3,11 @@ import sys
 import time
 import logging
 import requests
+
 # ========== 載入環境變數 ==========
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from collections import deque 
 load_dotenv()
 try:
     import ccxt
@@ -13,7 +15,6 @@ except ImportError:
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
-
 # ========== 設定 logging ==========
 logging.basicConfig(
     level=logging.INFO,
