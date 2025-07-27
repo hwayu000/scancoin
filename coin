@@ -48,6 +48,13 @@ binance_futures = ccxt.binance({
     'options': {'defaultType': 'future'},
     'enableRateLimit': True
 })
+# 加这段：确保 symbols / markets 已经被填充
+binance_futures.load_markets()
+for ex in exchanges.values():
+    try:
+        ex.load_markets()
+    except Exception as e:
+        logging.warning(f"{ex.id} load_markets 失败: {e}")
 #####################################
 def get_binance_futures_symbols_via_requests():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
