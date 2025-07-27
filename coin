@@ -1,0 +1,205 @@
+import os
+import sys
+import time
+import logging
+import requests
+from datetime import datetime, timedelta
+
+# ========== 自動安裝 ccxt ==========
+try:
+    import ccxt
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
+# ========== 設定 logging ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# ========== 參數設定 ==========
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4617157719')
+
+# ========== 初始化交易所 ==========
+exchanges = {
+    'binance': ccxt.binance({'enableRateLimit': True}),
+    'bybit': ccxt.bybit({'enableRateLimit': True}),
+    'okx': ccxt.okx({'enableRateLimit': True}),
+    'bitget': ccxt.bitget({'enableRateLimit': True}),
+    'mexc': ccxt.mexc({'enableRateLimit': True}),
+    'gate': ccxt.gate({'enableRateLimit': True}),
+}
+
+binance_futures = ccxt.binance({
+    'options': {'defaultType': 'future'},
+    'enableRateLimit': True
+})
+#####################################
+def get_binance_futures_symbols_via_requests():
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    try:
+        data = requests.get(url, timeout=10).json()
+        symbols = [
+            s['symbol'] for s in data['symbols']
+            if s['contractType'] in ['PERPETUAL', 'CURRENT_QUARTER', 'NEXT_QUARTER']
+            and s['quoteAsset'] == 'USDT'
+        ]
+        # 轉成 ccxt 格式（BTCUSDT -> BTC/USDT）
+        symbols = [s.replace('USDT', '/USDT') for s in symbols]
+        return symbols
+    except Exception as e:
+        print(f"requests 取得 Binance 期貨交易對失敗: {e}")
+        return []
+
+symbols = get_binance_futures_symbols_via_requests()
+print(f"總共偵測到 {len(symbols)} 個幣種")
+symbols = get_binance_futures_symbols_via_requests()
+message = f"總共偵測到 {len(symbols)} 個幣種"
+# 送到 Telegram 群組
+send_alert(message)
+# （如果還想在 console 顯示）
+print(message)
+############################
+# ========== 直接用 requests 取得 Binance 期貨 USDT 交易對清單 ==========
+def get_binance_futures_symbols_via_requests():
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    try:
+        data = requests.get(url, timeout=10).json()
+        symbols = [
+            s['symbol'] for s in data['symbols']
+            if s['contractType'] in ['PERPETUAL', 'CURRENT_QUARTER', 'NEXT_QUARTER']
+            and s['quoteAsset'] == 'USDT'
+        ]
+        # 轉成 ccxt 格式（BTCUSDT -> BTC/USDT）
+        symbols = [s.replace('USDT', '/USDT') for s in symbols]
+        return symbols
+    except Exception as e:
+        logging.error(f"requests 取得 Binance 期貨交易對失敗: {e}")
+        return []
+
+# ========== 發送警報 ==========
+def send_alert(message):
+    # Telegram
+    tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    tg_payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
+    try:
+        tg_resp = requests.post(tg_url, data=tg_payload, timeout=10)
+        if tg_resp.status_code != 200:
+            logging.warning(f"Telegram 發送失敗: {tg_resp.text}")
+    except Exception as e:
+        logging.error(f"Telegram 發送異常: {e}")
+
+
+
+# ========== 歷史資料儲存 ==========
+history = {}  # {symbol: {'spot': [(timestamp, price, volume)], 'futures': [(timestamp, open_interest)]}}
+
+# ========== 主循環 ==========
+def main():
+    futures_symbols = get_binance_futures_symbols_via_requests()
+    if not futures_symbols:
+        logging.error("無法取得 Binance 期貨交易對，程式結束")
+        return
+
+    logging.info(f"監控幣種數量: {len(futures_symbols)}")
+
+    while True:
+        start_time = time.time()
+        for symbol in futures_symbols:
+            base = symbol.split('/')[0]
+            spot_symbol = f"{base}/USDT"
+            max_vol = 0
+            max_ex = None
+            spot_ticker = None
+
+            # ========== 找出現貨成交額最大交易所 ==========
+            for ex_name, ex in exchanges.items():
+                try:
+                    if spot_symbol not in ex.symbols:
+                        continue
+                    ticker = ex.fetch_ticker(spot_symbol)
+                    vol = ticker.get('quoteVolume', 0)
+                    if vol and vol > max_vol:
+                        max_vol = vol
+                        max_ex = ex
+                        spot_ticker = ticker
+                except Exception as e:
+                    logging.debug(f"{ex_name} 取得 {spot_symbol} ticker 失敗: {e}")
+
+            if not max_ex or not spot_ticker:
+                continue
+
+            # ========== 取得現貨 1 分鐘成交額與價格 ==========
+            try:
+                ohlcv = max_ex.fetch_ohlcv(spot_symbol, timeframe='1m', limit=2)
+                if len(ohlcv) < 2:
+                    continue
+                prev_close = ohlcv[-2][4]
+                curr_close = ohlcv[-1][4]
+                curr_vol = ohlcv[-1][5] * curr_close  # 成交量(幣) * 價格 = 成交額(USD)
+                price_change = (curr_close - prev_close) / prev_close * 100
+            except Exception as e:
+                logging.debug(f"{max_ex.id} 取得 {spot_symbol} 1m ohlcv 失敗: {e}")
+                continue
+
+            # ========== 取得期貨持倉量 ==========
+            try:
+                open_interest = binance_futures.fetch_open_interest(symbol)
+                curr_oi = float(open_interest['openInterest'])
+            except Exception as e:
+                logging.debug(f"Binance 取得 {symbol} 持倉量失敗: {e}")
+                continue
+
+            # ========== 歷史資料更新 ==========
+            now = datetime.utcnow()
+            if symbol not in history:
+                history[symbol] = {'spot': [], 'futures': []}
+            # spot: (timestamp, price, volume)
+            history[symbol]['spot'].append((now, curr_close, curr_vol))
+            # futures: (timestamp, open_interest)
+            history[symbol]['futures'].append((now, curr_oi))
+            # 保留最近 5 分鐘資料
+            history[symbol]['spot'] = [x for x in history[symbol]['spot'] if x[0] > now - timedelta(minutes=5)]
+            history[symbol]['futures'] = [x for x in history[symbol]['futures'] if x[0] > now - timedelta(minutes=5)]
+
+            # ========== 判斷現貨警報 ==========
+            if curr_vol > 50000 and abs(price_change) > 2:
+                msg = (
+                    f"{symbol} 現貨放量\n"
+                    f"來源交易所: {max_ex.id}\n"
+                    f"1 分鐘成交額: ${curr_vol:,.0f}\n"
+                    f"價格波動: {price_change:.2f}%"
+                )
+                logging.info(msg)
+                send_alert(msg)
+
+            # ========== 判斷期貨警報 ==========
+            # 5 分鐘前持倉
+            oi_hist = history[symbol]['futures']
+            if len(oi_hist) >= 2:
+                oi_5min_ago = oi_hist[0][1]
+                if oi_5min_ago > 0:
+                    oi_change = (curr_oi - oi_5min_ago) / oi_5min_ago * 100
+                    if oi_change > 5:
+                        msg = (
+                            f"{symbol} 期貨加倉\n"
+                            f"持倉增加: {oi_change:.2f}%\n"
+                            f"目前持倉: {curr_oi:,.0f}"
+                        )
+                        logging.info(msg)
+                        send_alert(msg)
+
+            # ========== 控制 API 呼叫頻率 ==========
+            time.sleep(0.2)  # 每個幣種間隔，避免觸發限頻
+
+        # ========== 每 1 分鐘執行一次 ==========
+        elapsed = time.time() - start_time
+        if elapsed < 60:
+            time.sleep(60 - elapsed)
+
+if __name__ == "__main__":
+    main() 
