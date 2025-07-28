@@ -9,6 +9,7 @@ import websocket # 這裡導入的是 websocket-client 庫中的 websocket 模�
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv # 引入 dotenv 庫來加載 .env 文件
+import re # 確保在全局範圍導入 re 模組
 
 # 加載 .env 文件中的環境變數。這應該在其他環境變數使用之前執行。
 load_dotenv()
@@ -266,7 +267,7 @@ def start_spot_websocket_client():
 
 def retry_fetch(url, retries=3, delay=1000):
     global is_ip_banned, ban_until
-    import re # 確保在函數內部導入正則表達式模組
+    # re 模組已在文件頂部導入，無需在此處重複導入
 
     for i in range(retries):
         current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
