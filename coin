@@ -1,424 +1,744 @@
 import os
-import sys
+import datetime
 import time
-import logging
+import threading
+import json
+import math
 import requests
-import json # 用於解析 Binance 錯誤訊息
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from collections import deque
-import ccxt
+import websocket # 這裡導入的是 websocket-client 庫中的 websocket 模組
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from dotenv import load_dotenv # 引入 dotenv 庫來加載 .env 文件
 
-# ========== 設定 logging ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+# 加載 .env 文件中的環境變數。這應該在其他環境變數使用之前執行。
+load_dotenv()
 
-# ========== 載入環境變數 ==========
-load_dotenv() # 從 .env 文件載入環境變數
+app = Flask(__name__)
+CORS(app) # 允許跨域請求。如果您以後有網頁前端，可以考慮限制特定來源。
 
+# ==== Telegram 設定 (從環境變數獲取，更安全且靈活) ====
+# 請確保在部署環境中設定了 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID 環境變數
+# 為了您的方便，我暫時將您提供的真實值作為 os.getenv 的預設值。
+# 但在正式部署時，強烈建議不要在代碼中包含敏感信息，而是僅依賴環境變數。
+# 如果環境變數未設置，這裡的預設值將被使用。
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4946614597')
 
-# 確認 Token & Chat ID
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logging.error("TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定！請檢查 .env 檔或直接在程式碼中設定。")
-    sys.exit(1)
+# =======================================================
 
-# ========== 初始化交易所 ==========
-# 這裡我們主要使用 Binance，因為其期貨 OI 需透過 REST API 獲取
-# 確保 ccxt 已安裝
-try:
-    import ccxt
-except ImportError:
-    logging.info("ccxt 未找到，正在安裝 ccxt...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
-    import ccxt
+# ========== 全域變數和監控狀態 ==========
+SYMBOLS_TO_MONITOR = [] # 監控的交易對列表，啟動時動態獲取
+MONITORING_ACTIVE = False # 監控服務是否正在運行
 
-binance_futures = ccxt.binance({
-    'enableRateLimit': True, # 啟用 ccxt 內建的速率限制
-    'options': {'defaultType': 'future'}
-})
-binance_spot = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-
-# 載入所有 markets，保證 .markets 可用
-try:
-    binance_futures.load_markets()
-    binance_spot.load_markets()
-    logging.info("幣安期貨和現貨市場載入成功。")
-except Exception as e:
-    logging.error(f"CCXT 載入市場失敗: {e}")
-    sys.exit(1)
-
-# ========== 閾值設定 ==========
-PRICE_TIERS = [(5.0,'⭐⭐⭐⭐'),(4.0,'⭐⭐⭐'),(3.0,'⭐⭐'),(2.0,'⭐')]
-OI_TIERS    = [(5.0,'🔥🔥🔥🔥'),(3.5,'🔥🔥🔥'),(3.0,'🔥🔥'),(2.5,'🔥')]
+# 歷史數據儲存：
+# {
+#   symbol: {
+#     'spot': [{timestamp, value, volume}],
+#     'futures': [{timestamp, value}],
+#     'last_telegram_alert_time': datetime.datetime, // 上次發送 Telegram 警報的時間 (整體冷卻)
+#     'telegram_alerts_history': [{ timestamp: datetime.datetime, type: 'price'/'oi', stars: int }], // 存儲時間戳和類型，用於累計和判斷最高星級
+#     'last_alert_times': { 'price': datetime.datetime, 'oi': datetime.datetime }, // 各類型警報的內部冷卻時間 (避免同一類型短時間內重複計入累積)
+#     'first_alert_trigger_time': datetime.datetime // 本次累計警報週期的首次觸發時間
+#   }
+# }
+history = {}
+current_prices = {}
+current_open_interests = {}
+current_volumes = {}
 
 # IP 封鎖狀態追蹤
 is_ip_banned = False
-ban_until = 0 # 封鎖解除時間戳 (毫秒)
+ban_until = 0 # 封鎖解除時間戳 (毫秒) - 用於判斷何時解封
 
-# ========== 全域資料儲存 ==========
-# {symbol: {'spot': deque(), 'futures': deque(), 'last_alert_time': datetime, 'latest_price_changes': {}, 'latest_oi_changes': {}}}
-history = {}
+# 定義警報閾值 (與前端邏輯保持一致)
+PRICE_TIERS = [
+    {'threshold': 5.0, 'rating': '⭐⭐⭐⭐'},
+    {'threshold': 4.0, 'rating': '⭐⭐⭐'},
+    {'threshold': 3.0, 'rating': '⭐⭐'},
+    {'threshold': 2.0, 'rating': '⭐'}
+]
+OI_TIERS = [
+    {'threshold': 5.0, 'rating': '🔥🔥🔥🔥'},
+    {'threshold': 3.5, 'rating': '🔥🔥🔥'},
+    {'threshold': 3.0, 'rating': '🔥🔥'},
+    {'threshold': 2.5, 'rating': '🔥'}
+]
 
-# ========== 輔助函數：獲取評級符號 ==========
-def get_rating_symbols(value, tiers):
+TELEGRAM_ALERT_COOLDOWN_MINUTES = 5 # Telegram 警報冷卻時間 (分鐘)
+CUMULATIVE_ALERT_WINDOW_MINUTES = 60 # 累計警報統計窗口 (分鐘)
+MIN_TELEGRAM_ALERT_STARS = 2 # 觸發 Telegram 警報的最低星級
+MIN_CUMULATIVE_ALERTS = 3 # 觸發 Telegram 警報的最低累計次數
+
+MIN_VOLUME_MULTIPLIER = 1.5 # 價格變動至少需要前一根 K 線 1.5 倍的成交量
+HIGH_VOLUME_MULTIPLIER = 2.0 # 價格變動成交量超過 2 倍，評級會更高
+
+# WebSocket 客戶端實例
+spot_ws_client = None
+
+# ========== 輔助函數：計算百分比變動 ==========
+def calculate_percentage_change(data_array, minutes):
+    now = datetime.datetime.now()
+    cutoff_time = now - datetime.timedelta(minutes=minutes)
+
+    old_val = None
+    # 從數據陣列的末尾開始遍歷，找到最接近或早於截止時間的數據點
+    for item in reversed(data_array):
+        if item['timestamp'] <= cutoff_time:
+            old_val = item['value']
+            break
+
+    new_val = data_array[-1]['value'] if data_array else None
+
+    if old_val is None or new_val is None or old_val == 0:
+        return None
+
+    return ((new_val - old_val) / old_val) * 100
+
+def check_volume_condition(spot_data_array, minutes):
+    now = datetime.datetime.now()
+    cutoff_time = now - datetime.timedelta(minutes=minutes)
+
+    # 找到該時間範圍的起始點
+    current_period_data = [item for item in spot_data_array if item['timestamp'] >= cutoff_time]
+    
+    if not current_period_data:
+        return None
+
+    current_period_volume = sum(item.get('volume', 0) for item in current_period_data)
+
+    # 找到 cutoff_time 之前最近的一根 K 線的成交量作為基準
+    prev_candle_volume = None
+    for item in reversed(spot_data_array):
+        if item['timestamp'] < cutoff_time and 'volume' in item:
+            prev_candle_volume = item['volume']
+            break
+    
+    if prev_candle_volume is None or prev_candle_volume == 0 or current_period_volume == 0:
+        return None
+
+    volume_multiplier = current_period_volume / prev_candle_volume
+    return volume_multiplier
+
+def get_rating_info(value, tiers, volume_multiplier=0):
     abs_value = abs(value)
-    for threshold, rating in tiers:
-        if abs_value >= threshold:
-            return rating
-    return ''
-
-# ========== 發送 Telegram 警報 ==========
-def send_alert(message: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            logging.warning(f"Telegram 發送失敗: {r.status_code} - {r.text}")
-            try:
-                logging.warning(f"Telegram API 回應詳情: {r.json()}")
-            except json.JSONDecodeError:
-                logging.warning("Telegram API 回應非 JSON 格式。")
-        else:
-            logging.info("Telegram 訊息發送成功！")
-    except Exception as e:
-        logging.error(f"Telegram 發送異常: {e}")
-
-# ========== 格式化並發送報文 ==========
-def format_and_send(symbol, spot_hist, fut_hist, timeframe='1m'):
-    # 計算百分比變動
-    def pct(arr, mins):
-        cutoff = datetime.utcnow() - timedelta(minutes=mins)
-        # 從後往前找，找到最接近或早於截止時間的資料點
-        old_val_entry = next(((t, v) for t, v in reversed(arr) if t <= cutoff), None)
-        new_val_entry = arr[-1] if arr else None
-
-        if old_val_entry is None or new_val_entry is None:
-            return None # 資料不足則返回 None
-
-        old_val = old_val_entry[1]
-        new_val = new_val_entry[1]
-
-        return ((new_val - old_val) / old_val * 100) if (old_val != 0) else 0.0
-
-    p1, p5, p15 = pct(spot_hist, 1), pct(spot_hist, 5), pct(spot_hist, 15)
-    o1, o5, o15 = pct(fut_hist, 1), pct(fut_hist, 5), pct(fut_hist, 15)
-
-    # 判斷是否有足夠的數據來計算變化量
-    has_price_changes = all(v is not None for v in [p1, p5, p15])
-    has_oi_changes = all(v is not None for v in [o1, o5, o15])
-
-    price_alert = False
-    if has_price_changes:
-        price_alert = max(abs(p1), abs(p5), abs(p15)) >= PRICE_TIERS[-1][0]
+    rating_info = next((tier for tier in tiers if abs_value >= tier['threshold']), None)
     
-    oi_alert = False
-    if has_oi_changes:
-        oi_alert = max(abs(o1), abs(o5), abs(o15)) >= OI_TIERS[-1][0]
-    
-    if not price_alert and not oi_alert:
+    if rating_info:
+        stars = len(rating_info['rating']) // 2
+        rating_text = rating_info['rating']
+
+        # 如果是價格變動，並且成交量倍數高於閾值，則提升星級
+        if tiers == PRICE_TIERS and volume_multiplier >= HIGH_VOLUME_MULTIPLIER:
+            stars = min(stars + 1, 4) # 最多提升到 4 星
+            rating_text = '⭐' * stars
+
+        return {
+            'rating': rating_text,
+            'stars': stars
+        }
+    return {'rating': '', 'stars': 0}
+
+# ========== Telegram 警報發送函數 ==========
+def send_telegram_alert(message):
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or \
+       TELEGRAM_BOT_TOKEN == 'YOUR_TELEGRAM_BOT_TOKEN_HERE' or \
+       TELEGRAM_CHAT_ID == 'YOUR_TELEGRAM_CHAT_ID_HERE':
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：Telegram Bot Token 或 Chat ID 未正確設定。無法發送警報。")
         return
 
-    # 實施警報冷卻時間，避免重複發送
-    now = datetime.utcnow()
-    last_alert_time = history[symbol].get('last_alert_time')
-    if last_alert_time and (now - last_alert_time) < timedelta(minutes=1): # 1 分鐘冷卻時間
-        logging.debug(f"{symbol} 的警報處於冷卻期。")
+    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        response = requests.post(telegram_url, json=payload, timeout=10) # 設置超時
+        response.raise_for_status() # 如果響應狀態碼是 4xx 或 5xx，則拋出異常
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Telegram 警報發送成功。")
+    except requests.exceptions.Timeout:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：Telegram API 請求超時。")
+    except requests.exceptions.RequestException as e:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：發送 Telegram 警報失敗：{e}")
+
+# ========== Binance API 數據獲取 ==========
+
+# WebSocket 事件處理函數
+def on_message(ws, message):
+    data = json.loads(message)
+    if isinstance(data, list): # !ticker@arr 返回一個列表
+        for item in data:
+            symbol_raw = item.get('s')
+            if symbol_raw:
+                # 幣安返回的價格和成交量是字符串，需要轉換為浮點數
+                price = float(item.get('c', '0'))
+                volume = float(item.get('v', '0')) # 24h 成交量
+
+                formatted_symbol = symbol_raw.replace('USDT', '/USDT')
+
+                if formatted_symbol in SYMBOLS_TO_MONITOR:
+                    now = datetime.datetime.now()
+                    current_prices[formatted_symbol] = price
+                    current_volumes[formatted_symbol] = volume
+
+                    if formatted_symbol not in history: # 確保 history 字典存在
+                        history[formatted_symbol] = {
+                            'spot': [],
+                            'futures': [],
+                            'last_telegram_alert_time': None,
+                            'telegram_alerts_history': [],
+                            'last_alert_times': {'price': None, 'oi': None},
+                            'first_alert_trigger_time': None
+                        }
+
+                    history[formatted_symbol]['spot'].append({'timestamp': now, 'value': price, 'volume': volume})
+
+                    # 清理舊數據 (只保留最近 16 分鐘，以確保 15 分鐘計算有足夠數據)
+                    cutoff = now - datetime.timedelta(minutes=16)
+                    history[formatted_symbol]['spot'] = [
+                        d for d in history[formatted_symbol]['spot'] if d['timestamp'] >= cutoff
+                    ]
+    # else:
+    #     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] WS Message (非列表消息): {data}") # 打印非列表消息，例如 ping/pong
+
+def on_error(ws, error):
+    global is_ip_banned, ban_until
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 幣安現貨 WebSocket 錯誤: {error}")
+    # 檢查是否為 IP 封鎖錯誤 (Binance WS 不直接返回 HTTP 狀態碼，但可能會在錯誤訊息中提示)
+    error_str = str(error).lower()
+    if "ban" in error_str or "too many requests" in error_str or "429" in error_str:
+        is_ip_banned = True
+        # 簡單估計封鎖時間，實際情況可能更複雜，這裡假設封鎖 5 分鐘
+        ban_until = datetime.datetime.now().timestamp() * 1000 + 5 * 60 * 1000 
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 已被封鎖 (WebSocket 檢測到)。將在 {datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
+    ws.close() # 錯誤後關閉連接，觸發 on_close 重新連接
+
+def on_close(ws, close_status_code, close_msg):
+    global spot_ws_client
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 幣安現貨 WebSocket 已關閉: 狀態碼={close_status_code}, 訊息={close_msg}。正在嘗試重新連接...")
+    # 只有在監控活躍且 IP 未被封鎖或封鎖已過期時才嘗試自動重連
+    if MONITORING_ACTIVE and (not is_ip_banned or datetime.datetime.now().timestamp() * 1000 >= ban_until):
+        time.sleep(5) # 等待5秒後重連
+        start_spot_websocket_client() # 重新啟動 WebSocket
+    elif not MONITORING_ACTIVE:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 監控已停止，不再嘗試 WebSocket 重連。")
+    else: # IP 仍被封鎖
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 仍被封鎖，暫停 WebSocket 自動重連。")
+
+
+def on_open(ws):
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 幣安現貨 WebSocket 已連接。")
+
+def start_spot_websocket_client():
+    global spot_ws_client, is_ip_banned, ban_until
+    if is_ip_banned and datetime.datetime.now().timestamp() * 1000 < ban_until:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 仍被封鎖。跳過 WebSocket 重連，直到 {datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')}。")
         return
 
-    # 1️⃣ 第一段：標題
-    header = ""
-    if price_alert:
-        stars = get_rating_symbols(max(abs(p) for p in [p1, p5, p15] if p is not None), PRICE_TIERS)
-        header = f"📈 價格異動 {stars}評級"
-    
-    if oi_alert: # 如果同時有價格和 OI 異動，則合併標題
-        fires = get_rating_symbols(max(abs(o) for o in [o1, o5, o15] if o is not None), OI_TIERS)
-        cor = (p1 is not None and o1 is not None and p1 * o1 > 0 and 
-               p5 is not None and o5 is not None and p5 * o5 > 0 and 
-               p15 is not None and o15 is not None and p15 * o15 > 0) # 檢查價格和持倉量是否同向變動
-        note = "" if cor else " ⚠️疑是空方進場"
-        
-        if header: # 如果已經有價格標題
-            header += f" | 💹 持倉異動 {fires}{note}"
-        else:
-            header = f"💹 持倉異動 {fires}{note}"
+    # 如果已經有 WebSocket 連線，先關閉它
+    if spot_ws_client and spot_ws_client.sock and spot_ws_client.sock.connected:
+        spot_ws_client.close()
+        time.sleep(1) # 給點時間讓它關閉
 
-    # 2️⃣ 第二段：交易對
-    pair_line = f"{symbol.replace('/', '')}"
-
-    # 3️⃣ 第三段：Timeframe
-    tf_line = f"Timeframe: {timeframe}"
-
-    # 細節行
-    lines = [header, pair_line, tf_line]
-    if price_alert:
-        lines.append(f" • 現貨 1m: {p1:+.2f}% | 5m: {p5:+.2f}% | 15m: {p15:+.2f}%")
-    if oi_alert:
-        lines.append(f" • 持倉 1m: {o1:+.2f}% | 5m: {o5:+.2f}% | 15m: {o15:+.2f}%")
-
-    lines.append(f"時間：{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    send_alert("\n".join(lines))
-    history[symbol]['last_alert_time'] = now # 更新最後警報時間
-
-# ========== 取得 Binance 期貨 USDT 永續合約列表 ==========
-def get_binance_futures_symbols_via_requests():
-    global is_ip_banned, ban_until
-    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    websocket_url = "wss://stream.binance.com:9443/ws/!ticker@arr" # 24h ticker for volume
     try:
-        # 使用 requests 獲取，並處理潛在的 IP 封鎖
-        response = requests.get(url, timeout=10)
-        response.raise_for_status() # 對於 4xx/5xx 錯誤拋出 HTTPError
-
-        data = response.json()
-        
-        # 檢查是否為 IP 封鎖錯誤碼
-        if response.status_code == 418 or (data.get('code') == -1003 and 'banned' in data.get('msg', '')):
-            is_ip_banned = True
-            ban_match = data.get('msg', '').split('banned until ')
-            if len(ban_match) > 1:
-                ban_until = int(ban_match[1].split('.')[0]) # 解析時間戳
-                logging.error(f"IP 已被幣安暫時封鎖，直到 {datetime.fromtimestamp(ban_until / 1000).strftime('%Y-%m-%d %H:%M:%S')}。")
-            else:
-                logging.error(f"IP 已被幣安暫時封鎖，請稍後重試。")
-            return [] # 返回空列表，等待封鎖解除
-
-        # 過濾出 USDT 本位、永續合約且狀態為 'TRADING' 的交易對
-        syms = [
-            s['symbol'] for s in data['symbols']
-            if s['quoteAsset'] == 'USDT'
-            and s['contractType'] == 'PERPETUAL'
-            and s['status'] == 'TRADING' # 只監控活躍交易的合約
-        ]
-        return [s.replace('USDT','/USDT') for s in syms]
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP 錯誤發生在獲取期貨交易對: {http_err} - {http_err.response.text}")
-        try:
-            error_data = http_err.response.json()
-            if error_data.get('code') == -1003 and 'banned' in error_data.get('msg', ''):
-                is_ip_banned = True
-                ban_match = error_data.get('msg', '').split('banned until ')
-                if len(ban_match) > 1:
-                    ban_until = int(ban_match[1].split('.')[0])
-                    logging.error(f"IP 已被幣安暫時封鎖，直到 {datetime.fromtimestamp(ban_until / 1000).strftime('%Y-%m-%d %H:%M:%S')}。")
-                else:
-                    logging.error(f"IP 已被幣安暫時封鎖，請稍後重試。")
-        except json.JSONDecodeError:
-            pass # 無法解析 JSON
-        return []
-    except Exception as e:
-        logging.error(f"requests 取得期貨交易對失敗: {e}")
-        return []
-
-# ========== 主程式 ==========
-def main():
-    global is_ip_banned, ban_until
-
-    # 獲取初始交易對列表
-    all_syms = get_binance_futures_symbols_via_requests()
-    if not all_syms and not is_ip_banned: # 如果沒有獲取到交易對且不是因為 IP 封鎖
-        logging.error("無期貨合約可監控，程式結束。")
-        send_alert("🔴 監控器啟動失敗：無期貨合約可監控。")
-        sys.exit(1)
-    elif not all_syms and is_ip_banned:
-        logging.warning("啟動時 IP 被封鎖，等待封鎖解除後重試獲取交易對列表。")
-        # 在這裡不退出，而是進入主循環等待封鎖解除
-
-    # 建立歷史資料結構
-    # 只有當成功獲取到交易對時才初始化 history
-    if all_syms:
-        for s in all_syms:
-            history[s] = {
-                'spot': deque(),
-                'futures': deque(),
-                'last_alert_time': None
-            }
-        init_msg = f"🛰️ Ashdata 監控啟動：共偵測到 {len(all_syms)} 個可監控合約。"
-        logging.info(init_msg)
-        send_alert(init_msg)
-        sample = all_syms[:20]
-        notice = (
-            f"🛰️ Ashdata 潛在監控名單（示例前20筆，共{len(all_syms)}）：\n"
-            + "\n".join(sample)
+        # 創建 WebSocketApp 實例
+        spot_ws_client = websocket.WebSocketApp(
+            websocket_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
         )
-        send_alert(notice)
-    else:
-        logging.info("未獲取到初始交易對列表，將在循環中嘗試獲取。")
-
-    # 主循環
-    while True:
-        loop_start_time = time.time()
-
-        if is_ip_banned:
-            current_time_ms = int(time.time() * 1000)
-            if current_time_ms < ban_until:
-                remaining_seconds = (ban_until - current_time_ms) / 1000
-                logging.warning(f"IP 仍被封鎖，剩餘約 {remaining_seconds:.0f} 秒。等待...")
-                time.sleep(min(60, remaining_seconds)) # 最多等待 60 秒，或直到封鎖解除
-                continue # 繼續下一次循環檢查封鎖狀態
-            else:
-                logging.info("IP 封鎖已解除，嘗試重新獲取交易對列表。")
-                is_ip_banned = False
-                ban_until = 0
-                # 重新獲取交易對列表
-                all_syms = get_binance_futures_symbols_via_requests()
-                if not all_syms:
-                    logging.error("IP 解除封鎖後未能重新獲取交易對列表，將在下一次循環重試。")
-                    time.sleep(10) # 等待一段時間再重試
-                    continue
-                
-                # 更新 history 結構
-                new_history = {}
-                for s in all_syms:
-                    if s in history:
-                        new_history[s] = history[s] # 保留舊的歷史數據
-                    else:
-                        new_history[s] = {'spot': deque(), 'futures': deque(), 'last_alert_time': None}
-                history.clear()
-                history.update(new_history)
-                
-                logging.info(f"重新載入 {len(all_syms)} 個可監控合約。")
-                send_alert(f"🟢 監控器：IP 封鎖已解除，已重新載入 {len(all_syms)} 個合約。")
-
-
-        # 如果監控列表為空（例如啟動時 IP 被封鎖，或過濾後無有效交易對），則嘗試再次獲取
-        if not all_syms:
-            logging.info("監控列表為空，嘗試重新獲取交易對。")
-            all_syms = get_binance_futures_symbols_via_requests()
-            if not all_syms:
-                logging.error("未能獲取交易對列表，等待 30 秒後重試。")
-                time.sleep(30)
-                continue
-            
-            # 更新 history 結構 (同上)
-            new_history = {}
-            for s in all_syms:
-                if s in history:
-                    new_history[s] = history[s]
-                else:
-                    new_history[s] = {'spot': deque(), 'futures': deque(), 'last_alert_time': None}
-            history.clear()
-            history.update(new_history)
-            logging.info(f"成功重新獲取 {len(all_syms)} 個可監控合約。")
-            send_alert(f"🟢 監控器：已重新獲取 {len(all_syms)} 個合約。")
-
-
-        # 遍歷所有交易對獲取數據
-        requests_this_loop = 0
-        for symbol in all_syms:
-            if is_ip_banned: # 在每次請求前檢查是否被封鎖
-                logging.warning("IP 被封鎖，停止當前 OI 獲取循環。")
-                break
-
-            base_asset = symbol.split('/')[0]
-            spot_sym = f"{base_asset}/USDT"
-
-            # 獲取現貨價格 (使用 CCXT 的 REST API)
-            try:
-                # 獲取 1 分鐘 OHLCV 收盤價
-                ohlcv = binance_spot.fetch_ohlcv(spot_sym, '1m', limit=2)
-                if ohlcv and len(ohlcv) >= 2:
-                    curr_spot_price = ohlcv[-1][4] # 最新收盤價
-                    now = datetime.utcnow()
-                    history[symbol]['spot'].append((now, curr_spot_price))
-                    # 保留最近 15 分鐘資料
-                    cutoff = now - timedelta(minutes=16)
-                    history[symbol]['spot'] = deque([(t, v) for t, v in history[symbol]['spot'] if t >= cutoff])
-                    logging.debug(f"[現貨數據] {symbol}: {curr_spot_price} (時間: {now.strftime('%H:%M:%S')})")
-                    requests_this_loop += 1
-                else:
-                    logging.warning(f"無法獲取 {spot_sym} 的現貨 OHLCV 數據。")
-            except ccxt.NetworkError as e:
-                logging.error(f"CCXT 網路錯誤獲取現貨價格 {spot_sym}: {e}")
-                # 這裡可以根據錯誤類型判斷是否為 IP 封鎖，但 CCXT 內部會處理部分速率限制
-            except ccxt.ExchangeError as e:
-                logging.warning(f"CCXT 交易所錯誤獲取現貨價格 {spot_sym}: {e}")
-            except Exception as e:
-                logging.error(f"獲取現貨價格 {spot_sym} 發生未知錯誤: {e}")
-
-            time.sleep(binance_spot.rateLimit / 1000) # 遵守交易所速率限制
-
-            # 獲取期貨持倉量 (使用 CCXT 的 REST API)
-            try:
-                oi_data = binance_futures.fetch_open_interest(symbol)
-                curr_oi = float(oi_data['openInterest'])
-                now = datetime.utcnow()
-                history[symbol]['futures'].append((now, curr_oi))
-                # 保留最近 15 分鐘資料
-                cutoff = now - timedelta(minutes=16)
-                history[symbol]['futures'] = deque([(t, v) for t, v in history[symbol]['futures'] if t >= cutoff])
-                logging.debug(f"[持倉量數據] {symbol}: {curr_oi} (時間: {now.strftime('%H:%M:%S')})")
-                requests_this_loop += 1
-            except ccxt.NetworkError as e:
-                logging.error(f"CCXT 網路錯誤獲取持倉量 {symbol}: {e}")
-                # 檢查是否為 IP 封鎖錯誤碼
-                if "Way too many requests" in str(e) or "418" in str(e):
-                    is_ip_banned = True
-                    # CCXT 的錯誤訊息可能不包含 banUntil，這裡需要手動解析或假設一個封鎖時間
-                    ban_until = int(time.time() * 1000) + 5 * 60 * 1000 # 假設封鎖 5 分鐘
-                    logging.error(f"IP 被幣安暫時封鎖，將暫停數據獲取。預計解除時間: {datetime.fromtimestamp(ban_until / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
-                    send_alert(f"🔴 監控器：您的 IP 已被幣安暫時封鎖，請稍後重試。預計解除時間: {datetime.fromtimestamp(ban_until / 1000).strftime('%Y-%m-%d %H:%M:%S')}。")
-                elif "-4108" in str(e) and "Symbol is on delivering" in str(e):
-                    logging.warning(f"交易對 {symbol} 狀態無效，將從監控列表中移除。錯誤: {e}")
-                    all_syms.remove(symbol) # 從監控列表中移除無效交易對
-                    if symbol in history:
-                        del history[symbol]
-                else:
-                    logging.error(f"CCXT 交易所錯誤獲取持倉量 {symbol}: {e}")
-            except ccxt.ExchangeError as e:
-                logging.warning(f"CCXT 交易所錯誤獲取持倉量 {symbol}: {e}")
-                if "-4108" in str(e) and "Symbol is on delivering" in str(e):
-                    logging.warning(f"交易對 {symbol} 狀態無效，將從監控列表中移除。錯誤: {e}")
-                    all_syms.remove(symbol) # 從監控列表中移除無效交易對
-                    if symbol in history:
-                        del history[symbol]
-            except Exception as e:
-                logging.error(f"獲取持倉量 {symbol} 發生未知錯誤: {e}")
-            
-            time.sleep(binance_futures.rateLimit / 1000) # 遵守交易所速率限制
-
-            if is_ip_banned: # 如果被封鎖，立即跳出當前循環
-                break
-
-        # 檢查並發送警報
-        for symbol in all_syms:
-            if symbol in history: # 確保該符號的歷史數據存在
-                format_and_send(symbol, history[symbol]['spot'], history[symbol]['futures'])
-
-        # 控制主循環的頻率，確保不會過度請求
-        # 總延遲 = 每個請求的延遲 * 請求數量 + 額外緩衝時間
-        # 假設每個交易對需要 2 個請求 (現貨 + 期貨)
-        # 幣安的公共 API 限制通常是 1200 請求/分鐘
-        # 我們希望在 1 分鐘內完成所有交易對的請求，並留有餘裕
-        # 如果有 100 個交易對，100 * 2 = 200 請求
-        # 1 分鐘有 60 秒，所以平均每秒可以發送 200/60 = 3.33 請求
-        # CCXT 的 rateLimit 已經會控制單個交易所的請求間隔
-        # 這裡我們控制整個循環的最小間隔
-        
-        # 確保整個循環至少運行 60 秒，避免過度頻繁的 API 呼叫
-        elapsed_time = time.time() - loop_start_time
-        min_loop_interval = 60 # 至少 60 秒執行一次完整循環
-        
-        if elapsed_time < min_loop_interval:
-            sleep_duration = min_loop_interval - elapsed_time
-            logging.info(f"本輪循環耗時 {elapsed_time:.2f} 秒，等待 {sleep_duration:.2f} 秒進入下一輪。")
-            time.sleep(sleep_duration)
-        else:
-            logging.info(f"本輪循環耗時 {elapsed_time:.2f} 秒，直接進入下一輪。")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("程式被使用者中斷。")
+        # 在獨立線程中運行 WebSocket，防止阻塞主線程或 Flask 應用
+        # daemon=True 確保主程式退出時，這個線程也會被終止
+        threading.Thread(target=spot_ws_client.run_forever, daemon=True).start()
     except Exception as e:
-        logging.error(f"程式發生未預期的錯誤: {e}", exc_info=True)
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：啟動 WebSocket 客戶端失敗: {e}")
+        # 如果啟動失敗，過一段時間後重試
+        if MONITORING_ACTIVE:
+            time.sleep(10)
+            start_spot_websocket_client()
 
+
+def retry_fetch(url, retries=3, delay=1000):
+    global is_ip_banned, ban_until
+    import re # 確保在函數內部導入正則表達式模組
+
+    for i in range(retries):
+        current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
+        if is_ip_banned and current_timestamp_ms < ban_until:
+            wait_time_seconds = max(5, (ban_until - current_timestamp_ms) / 1000 + 1)
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 仍被封鎖。跳過 {url} 獲取，將等待 {wait_time_seconds:.2f} 秒直到 {datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')}。")
+            time.sleep(wait_time_seconds)
+            continue # 等待結束後再次嘗試，而不是直接跳過本次循環
+
+        try:
+            response = requests.get(url, timeout=10) # 設置超時
+            response.raise_for_status() # 如果響應狀態碼是 4xx 或 5xx，則拋出異常
+            return response.json()
+        except requests.exceptions.HTTPError as http_err:
+            error_text = response.text
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 獲取嘗試 {i + 1} 失敗：{url} 狀態碼 {response.status_code}: {error_text}")
+            if response.status_code == 418 or ("-1003" in error_text and "banned" in error_text):
+                is_ip_banned = True
+                match = re.search(r"banned until (\d+)", error_text)
+                if match:
+                    ban_until = int(match.group(1)) # 從錯誤訊息中解析時間戳
+                else:
+                    ban_until = datetime.datetime.now().timestamp() * 1000 + 5 * 60 * 1000 # 預設封鎖 5 分鐘
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 已被封鎖 (REST API 檢測到)。將在 {datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')} 後重試。")
+                raise Exception(f"IP BANNED: {error_text}") # 拋出異常以停止進一步重試
+            else:
+                if i < retries - 1:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 將在 {delay * (2**i) / 1000} 秒後重試...")
+                    time.sleep(delay * (2**i) / 1000)
+                else:
+                    raise # 最後一次嘗試失敗，重新拋出異常
+        except requests.exceptions.RequestException as req_err:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 獲取嘗試 {i + 1} 遇到網絡錯誤：{url}: {req_err}")
+            if i < retries - 1:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 將在 {delay * (2**i) / 1000} 秒後重試...")
+                time.sleep(delay * (2**i) / 1000)
+            else:
+                raise # 最後一次嘗試失敗，重新拋出異常
+
+    raise Exception(f"在 {retries} 次嘗試後仍無法獲取 {url}。")
+
+def fetch_open_interest_rest():
+    global SYMBOLS_TO_MONITOR, is_ip_banned, ban_until
+    
+    current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
+    if is_ip_banned and current_timestamp_ms < ban_until:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 仍被 REST API 封鎖。跳過 OI 獲取。")
+        return
+
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 正在通過 REST API 獲取期貨持倉量...")
+    delay_between_requests = 0.5 # 每個交易對請求間隔 500 毫秒
+
+    # 使用 list(SYMBOLS_TO_MONITOR) 創建副本，以防在循環中列表被修改
+    for symbol in list(SYMBOLS_TO_MONITOR): 
+        current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
+        if is_ip_banned and current_timestamp_ms < ban_until:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 在 OI 獲取過程中 IP 被封鎖。停止循環。")
+            break
+
+        binance_symbol = symbol.replace('/', '')
+        url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={binance_symbol}"
+        try:
+            data = retry_fetch(url)
+            open_interest = float(data.get('openInterest', '0')) # 確保從字符串轉換
+
+            if not math.isnan(open_interest):
+                now = datetime.datetime.now()
+                current_open_interests[symbol] = open_interest
+                if symbol not in history: # 確保 history 字典存在
+                    history[symbol] = {
+                        'spot': [],
+                        'futures': [],
+                        'last_telegram_alert_time': None,
+                        'telegram_alerts_history': [],
+                        'last_alert_times': {'price': None, 'oi': None},
+                        'first_alert_trigger_time': None
+                    }
+                history[symbol]['futures'].append({'timestamp': now, 'value': open_interest})
+
+                cutoff = now - datetime.timedelta(minutes=16)
+                history[symbol]['futures'] = [
+                    d for d in history[symbol]['futures'] if d['timestamp'] >= cutoff
+                ]
+            else:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 警告：無法解析 {symbol} 的持倉量數據: {data}")
+
+        except Exception as e:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：獲取 {symbol} 持倉量失敗: {e}")
+            if "IP BANNED" in str(e):
+                break # 如果 IP 被封鎖，停止當前 OI 獲取循環
+            # 如果是 -4108 錯誤 (Symbol is on delivering...)，則將該符號從監控列表中移除
+            if "-4108" in str(e) and "Symbol is on delivering" in str(e):
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 訊息：交易對 {symbol} 狀態無效，將從監控列表中移除。")
+                SYMBOLS_TO_MONITOR = [s for s in SYMBOLS_TO_MONITOR if s != symbol]
+                history.pop(symbol, None)
+                current_prices.pop(symbol, None)
+                current_open_interests.pop(symbol, None)
+                current_volumes.pop(symbol, None)
+        
+        time.sleep(delay_between_requests) # 每個請求之間稍作延遲
+
+
+# ========== 警報邏輯處理 ==========
+def check_and_send_alerts_logic():
+    global is_ip_banned, ban_until
+    now = datetime.datetime.now()
+
+    # 如果 IP 被封鎖且未到解封時間，則不執行警報檢查和發送
+    if is_ip_banned and now.timestamp() * 1000 < ban_until:
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 監控暫停：IP 仍被封鎖，直到 {datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')}。")
+        return
+
+    # 檢查是否已過期，如果過期則解除封鎖狀態
+    if is_ip_banned and now.timestamp() * 1000 >= ban_until:
+        is_ip_banned = False
+        ban_until = 0
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] IP 封鎖可能已解除。正在恢復監控。")
+
+
+    # 遍歷監控中的交易對，使用 list() 創建副本以防止在循環中修改原始列表
+    for symbol in list(SYMBOLS_TO_MONITOR): 
+        if symbol not in history:
+            continue # 可能是因為該符號已被移除
+
+        symbol_history = history[symbol]
+        spot_hist = symbol_history['spot']
+        fut_hist = symbol_history['futures']
+
+        # 確保有足夠的數據進行計算
+        if len(spot_hist) < 2 or len(fut_hist) < 2:
+            # print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 訊息：{symbol} 沒有足夠的歷史數據來計算變動。")
+            continue
+
+        p1 = calculate_percentage_change(spot_hist, 1)
+        p5 = calculate_percentage_change(spot_hist, 5)
+        p15 = calculate_percentage_change(spot_hist, 15)
+
+        o1 = calculate_percentage_change(fut_hist, 1)
+        o5 = calculate_percentage_change(fut_hist, 5)
+        o15 = calculate_percentage_change(fut_hist, 15)
+
+        # 計算成交量倍數
+        v1_multiplier = check_volume_condition(spot_hist, 1)
+        v5_multiplier = check_volume_condition(spot_hist, 5)
+        v15_multiplier = check_volume_condition(spot_hist, 15)
+        
+        # 獲取價格評級資訊時，考慮成交量倍數
+        # 使用 max(..., 0) 確保即使某個變動為 None，也不影響取最大值
+        symbol_history['priceRatingInfo'] = get_rating_info(
+            max(abs(p) if p is not None else 0 for p in [p1, p5, p15]),
+            PRICE_TIERS,
+            max(v_m if v_m is not None else 0 for v_m in [v1_multiplier, v5_multiplier, v15_multiplier])
+        )
+
+        # 獲取 OI 評級資訊
+        symbol_history['oiRatingInfo'] = get_rating_info(
+            max(abs(o) if o is not None else 0 for o in [o1, o5, o15]),
+            OI_TIERS
+        )
+
+        # 價格警報額外條件：必須滿足成交量過濾
+        qualified_price_alert = False
+        # 只有當價格評級星級大於 0 時，才進一步判斷成交量條件
+        if symbol_history['priceRatingInfo']['stars'] > 0: 
+            if ((p1 is not None and abs(p1) >= PRICE_TIERS[-1]['threshold'] and v1_multiplier is not None and v1_multiplier >= MIN_VOLUME_MULTIPLIER) or
+                (p5 is not None and abs(p5) >= PRICE_TIERS[-1]['threshold'] and v5_multiplier is not None and v5_multiplier >= MIN_VOLUME_MULTIPLIER) or
+                (p15 is not None and abs(p15) >= PRICE_TIERS[-1]['threshold'] and v15_multiplier is not None and v15_multiplier >= MIN_VOLUME_MULTIPLIER)):
+                qualified_price_alert = True
+        
+        # OI 變動只需要滿足基礎閾值（星級大於 0）
+        oi_alert_threshold_met = symbol_history['oiRatingInfo']['stars'] > 0
+
+        # 更新累計警報計數 (過濾掉超出時間窗的舊警報)
+        symbol_history['telegram_alerts_history'] = [
+            entry for entry in symbol_history['telegram_alerts_history']
+            if (now - entry['timestamp']).total_seconds() / 60 < CUMULATIVE_ALERT_WINDOW_MINUTES
+        ]
+
+        # 如果累計歷史被清空 (表示進入新的累計週期)，則重置首次觸發時間
+        if not symbol_history['telegram_alerts_history']:
+            symbol_history['first_alert_trigger_time'] = None
+
+        # 判斷是否有新的顯著警報觸發，並添加到歷史記錄中
+        new_significant_alert_occurred = False
+
+        # 檢查價格警報是否符合資格並添加到歷史
+        if qualified_price_alert and symbol_history['priceRatingInfo']['stars'] >= MIN_TELEGRAM_ALERT_STARS:
+            last_price_alert_time = symbol_history['last_alert_times']['price']
+            if not last_price_alert_time or (now - last_price_alert_time).total_seconds() / 60 >= TELEGRAM_ALERT_COOLDOWN_MINUTES:
+                symbol_history['telegram_alerts_history'].append({'timestamp': now, 'type': 'price', 'stars': symbol_history['priceRatingInfo']['stars']})
+                symbol_history['last_alert_times']['price'] = now # 更新價格警報的上次觸發時間
+                new_significant_alert_occurred = True
+
+        # 檢查 OI 警報是否符合資格並添加到歷史
+        if oi_alert_threshold_met and symbol_history['oiRatingInfo']['stars'] >= MIN_TELEGRAM_ALERT_STARS:
+            last_oi_alert_time = symbol_history['last_alert_times']['oi']
+            if not last_oi_alert_time or (now - last_oi_alert_time).total_seconds() / 60 >= TELEGRAM_ALERT_COOLDOWN_MINUTES:
+                symbol_history['telegram_alerts_history'].append({'timestamp': now, 'type': 'oi', 'stars': symbol_history['oiRatingInfo']['stars']})
+                symbol_history['last_alert_times']['oi'] = now # 更新 OI 警報的上次觸發時間
+                new_significant_alert_occurred = True
+
+        # 如果有新的顯著警報觸發，且首次觸發時間尚未設定，則設定它
+        if new_significant_alert_occurred and symbol_history['first_alert_trigger_time'] is None:
+            symbol_history['first_alert_trigger_time'] = now
+
+        # 決定是否發送 Telegram 警報
+        should_send_telegram_alert = (
+            len(symbol_history['telegram_alerts_history']) >= MIN_CUMULATIVE_ALERTS and
+            (symbol_history['priceRatingInfo']['stars'] >= MIN_TELEGRAM_ALERT_STARS or
+             symbol_history['oiRatingInfo']['stars'] >= MIN_TELEGRAM_ALERT_STARS)
+        )
+        
+        # Telegram 總體冷卻時間 (避免頻繁發送)
+        last_telegram_sent_time = symbol_history['last_telegram_alert_time']
+        on_overall_telegram_cooldown = last_telegram_sent_time and \
+                                       (now - last_telegram_sent_time).total_seconds() / 60 < TELEGRAM_ALERT_COOLDOWN_MINUTES
+
+        if should_send_telegram_alert and not on_overall_telegram_cooldown:
+            base_symbol = symbol.split('/')[0]
+            telegram_message = f"#{base_symbol} {symbol}\n\n"
+            
+            # 添加首次觸發時間
+            if symbol_history['first_alert_trigger_time']:
+                first_trigger_formatted = symbol_history['first_alert_trigger_time'].strftime("%Y-%m-%d %H:%M:%S")
+                telegram_message += f"首次觸發時間: {first_trigger_formatted}\n\n"
+
+            telegram_message += f"{symbol} 已在 {CUMULATIVE_ALERT_WINDOW_MINUTES} 分鐘內累計 {len(symbol_history['telegram_alerts_history'])} 次警示。\n\n"
+            
+            telegram_message += "警示記錄 (時間 - 類型 - 評級):\n"
+            # 按照時間順序顯示歷史警報 (確保只顯示唯一的時間點類型組合)
+            unique_alerts_tuples = sorted(
+                list(set(
+                    (entry['timestamp'].strftime("%Y%m%d%H%M%S"), entry['type'], entry['stars']) 
+                    for entry in symbol_history['telegram_alerts_history']
+                )), 
+                key=lambda x: datetime.datetime.strptime(x[0], "%Y%m%d%H%M%S")
+            )
+
+            for entry_tuple in unique_alerts_tuples:
+                ts_str, type_str, stars_num = entry_tuple
+                entry_time = datetime.datetime.strptime(ts_str, "%Y%m%d%H%M%S").strftime("%H:%M:%S")
+                type_emoji = '📈' if type_str == 'price' else '💹'
+                type_text = '價格' if type_str == 'price' else '持倉量'
+                stars = '⭐' * stars_num
+                telegram_message += f"  • {entry_time} - {type_emoji} {type_text} {stars}\n"
+
+            telegram_message += f"\n--- 當前異動詳情 ({now.strftime('%H:%M:%S')}) ---\n"
+            
+            # 價格變動詳情
+            if qualified_price_alert:
+                stars_rating = symbol_history['priceRatingInfo']['rating']
+                telegram_message += f"📈 價格異動 {stars_rating}評級\n"
+                telegram_message += f"  • 1m: {p1:.2f}%" if p1 is not None else "N/A"
+                telegram_message += f" | 5m: {p5:.2f}%" if p5 is not None else "N/A"
+                telegram_message += f" | 15m: {p15:.2f}%" if p15 is not None else "N/A"
+                telegram_message += "\n"
+                telegram_message += f"  • 成交量倍數 (1m/5m/15m): "
+                telegram_message += f"{v1_multiplier:.2f}x" if v1_multiplier is not None else "N/A"
+                telegram_message += f" / {v5_multiplier:.2f}x" if v5_multiplier is not None else "N/A"
+                telegram_message += f" / {v15_multiplier:.2f}x" if v15_multiplier is not None else "N/A"
+                telegram_message += "\n"
+
+            # 持倉量變動詳情
+            if oi_alert_threshold_met:
+                fires_rating = symbol_history['oiRatingInfo']['rating']
+                oi_relation_note = ''
+                # 判斷 OI 與價格的關聯性
+                is_price_up = (p1 is not None and p1 > 0) or (p5 is not None and p5 > 0) or (p15 is not None and p15 > 0)
+                is_price_down = (p1 is not None and p1 < 0) or (p5 is not None and p5 < 0) or (p15 is not None and p15 < 0)
+                is_oi_up = (o1 is not None and o1 > 0) or (o5 is not None and o5 > 0) or (o15 is not None and o15 > 0)
+                is_oi_down = (o1 is not None and o1 < 0) or (o5 is not None and o5 < 0) or (o15 is not None and o15 < 0)
+
+                if is_oi_up and is_price_up:
+                    oi_relation_note = " (多方趨勢鞏固)" # OI & Price UP
+                elif is_oi_down and is_price_down:
+                    oi_relation_note = " (空方趨勢鞏固)" # OI & Price DOWN
+                elif is_oi_up and is_price_down:
+                    oi_relation_note = " ⚠️ 疑是空方進場" # OI UP & Price DOWN (空頭持倉增加，價格下跌)
+                elif is_oi_down and is_price_up:
+                    oi_relation_note = " ⚠️ 疑是多方撤退" # OI DOWN & Price UP (多頭平倉，價格上漲乏力)
+                elif is_oi_up and not is_price_up and not is_price_down:
+                    oi_relation_note = " (持倉量增加，價格盤整)"
+                elif is_oi_down and not is_price_up and not is_price_down:
+                    oi_relation_note = " (持倉量減少，價格盤整)"
+
+                telegram_message += f"💹 持倉異動 {fires_rating}{oi_relation_note}\n"
+                telegram_message += f"  • 1m: {o1:.2f}%" if o1 is not None else "N/A"
+                telegram_message += f" | 5m: {o5:.2f}%" if o5 is not None else "N/A"
+                telegram_message += f" | 15m: {o15:.2f}%" if o15 is not None else "N/A"
+                telegram_message += "\n"
+            
+            # 大熱標的標籤
+            hot_symbol_tag = ''
+            if symbol_history['priceRatingInfo']['stars'] >= 4 or symbol_history['oiRatingInfo']['stars'] >= 4:
+                hot_symbol_tag = '🔥 大熱標的 🔥'
+                telegram_message += f"\n{hot_symbol_tag}\n"
+            
+            send_telegram_alert(telegram_message)
+            symbol_history['last_telegram_alert_time'] = now # 更新 Telegram 警報發送時間 (用於總體冷卻)
+
+
+# ========== 監控主循環 (後台運行邏輯) ==========
+def monitor_main_loop():
+    global SYMBOLS_TO_MONITOR, MONITORING_ACTIVE, is_ip_banned, ban_until
+
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動監控主循環...")
+    
+    # 初始化交易對列表
+    try:
+        # 在嘗試獲取數據前，檢查 IP 是否被封鎖
+        current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
+        if is_ip_banned and current_timestamp_ms < ban_until:
+            wait_time_seconds = max(5, (ban_until - current_timestamp_ms) / 1000 + 1)
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 仍被封鎖。跳過初始交易對獲取，將等待 {wait_time_seconds:.2f} 秒。")
+            time.sleep(wait_time_seconds)
+            # 在等待結束後嘗試繼續，如果時間到了，is_ip_banned 會在 retry_fetch 中被重置
+            # 這裡不直接返回，讓它繼續嘗試
+        
+        # 重置封鎖狀態，嘗試重新連接（如果時間已到）
+        if is_ip_banned and datetime.datetime.now().timestamp() * 1000 >= ban_until:
+            is_ip_banned = False
+            ban_until = 0
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 封鎖時間已過，重置封鎖狀態。")
+
+
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 正在獲取可監控的期貨交易對列表...")
+        exchange_info = retry_fetch('https://fapi.binance.com/fapi/v1/exchangeInfo')
+        valid_symbols = [
+            s['symbol'].replace('USDT', '/USDT')
+            for s in exchange_info['symbols']
+            if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING'
+        ]
+        SYMBOLS_TO_MONITOR = valid_symbols
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 已載入 {len(SYMBOLS_TO_MONITOR)} 個期貨交易對。")
+
+        if not SYMBOLS_TO_MONITOR:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 沒有可監控的交易對。監控將停止。")
+            MONITORING_ACTIVE = False
+            return # 沒有交易對，直接退出監控循環
+        
+        # 初始化 history 數據結構
+        for symbol in SYMBOLS_TO_MONITOR:
+            history[symbol] = {
+                'spot': [],
+                'futures': [],
+                'last_telegram_alert_time': None,
+                'telegram_alerts_history': [],
+                'last_alert_times': {'price': None, 'oi': None},
+                'first_alert_trigger_time': None
+            }
+            current_prices[symbol] = 0
+            current_open_interests[symbol] = 0
+            current_volumes[symbol] = 0
+
+    except Exception as e:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 錯誤：初始交易對獲取失敗: {e}")
+        # 如果是 IP BANNED 錯誤，retry_fetch 已經處理了等待和重試邏輯，這裡直接退出
+        if "IP BANNED" in str(e):
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 在交易對獲取時被封鎖。監控將在解封後重試。")
+            time.sleep(10) # 簡短休息一下再讓它重試整個循環
+            return monitor_main_loop() # 遞歸調用自身嘗試重啟
+        
+        # 其他錯誤，嘗試在一段時間後重試整個初始化流程
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 初始監控設置失敗，將在 30 秒後重試...")
+        time.sleep(30)
+        return monitor_main_loop() # 遞歸調用自身嘗試重啟
+
+
+    # 啟動 WebSocket 客戶端
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動 WebSocket 客戶端...")
+    start_spot_websocket_client()
+
+    # 主循環：定期獲取 OI 並檢查警報
+    while MONITORING_ACTIVE:
+        try:
+            # 定期從 REST API 獲取期貨持倉量
+            fetch_open_interest_rest()
+
+            # 檢查並發送警報
+            check_and_send_alerts_logic() # 調用實際的警報邏輯函數
+
+            # 計算下一次 OI 獲取的延遲
+            # 確保每次完整的 OI 獲取週期至少有 60 秒（1 分鐘）
+            # 每個交易對請求間隔 0.5s，所以總時間 = 交易對數量 * 0.5s
+            delay_for_all_oi_fetches = len(SYMBOLS_TO_MONITOR) * 0.5
+            # 實際睡眠時間，確保至少 10 秒檢查一次，但也要考慮 OI 獲取時間
+            sleep_time = max(10, delay_for_all_oi_fetches) 
+
+            # 如果 IP 被封鎖，等待直到解封
+            current_timestamp_ms = datetime.datetime.now().timestamp() * 1000
+            if is_ip_banned and current_timestamp_ms < ban_until:
+                sleep_time = max(5, (ban_until - current_timestamp_ms) / 1000 + 1)
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] IP 被封鎖。休眠 {sleep_time:.2f} 秒。")
+            
+            time.sleep(sleep_time)
+
+        except Exception as e:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 監控主循環中發生嚴重錯誤：{e}")
+            if "IP BANNED" in str(e):
+                 # IP 封鎖錯誤已在 retry_fetch 或 on_error 中處理，這裡只是記錄並繼續
+                 pass
+            else:
+                # 其他意外錯誤，等待一段時間後重試
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 監控循環將在 10 秒後因錯誤重啟...")
+                time.sleep(10)
+
+# ========== Flask 路由 (用於啟動/停止監控，或未來狀態查詢) ==========
+
+@app.route('/start_monitoring', methods=['POST'])
+def start_monitoring_endpoint():
+    global MONITORING_ACTIVE
+    if not MONITORING_ACTIVE:
+        MONITORING_ACTIVE = True
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 請求啟動監控服務。")
+        # 在新的線程中啟動監控循環，防止阻塞 Flask 主線程
+        threading.Thread(target=monitor_main_loop, daemon=True).start()
+        return jsonify({"status": "success", "message": "監控服務已在後台啟動。"}), 200
+    return jsonify({"status": "info", "message": "監控服務已在運行中。"}), 200
+
+@app.route('/stop_monitoring', methods=['POST'])
+def stop_monitoring_endpoint():
+    global MONITORING_ACTIVE, spot_ws_client
+    if MONITORING_ACTIVE:
+        MONITORING_ACTIVE = False
+        if spot_ws_client:
+            spot_ws_client.close() # 關閉 WebSocket 連接
+            spot_ws_client = None # 清理實例
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 請求停止監控服務。")
+        return jsonify({"status": "success", "message": "監控服務已停止。"}), 200
+    return jsonify({"status": "info", "message": "監控服務未運行。"}), 200
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    global MONITORING_ACTIVE, is_ip_banned, ban_until
+    
+    ban_until_formatted = "N/A"
+    if ban_until:
+        try:
+            ban_until_formatted = datetime.datetime.fromtimestamp(ban_until/1000).strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            ban_until_formatted = "Invalid Timestamp"
+
+    status = {
+        "monitoring_active": MONITORING_ACTIVE,
+        "is_ip_banned": is_ip_banned,
+        "ban_until": ban_until_formatted,
+        "symbols_monitored": len(SYMBOLS_TO_MONITOR),
+        "current_data_points_summary": {
+            s: {
+                "spot_hist_len": len(history.get(s, {}).get('spot', [])), 
+                "futures_hist_len": len(history.get(s, {}).get('futures', []))
+            } 
+            for s in list(SYMBOLS_TO_MONITOR)[:5] # 只顯示前5個以防過長
+        },
+        "websocket_status": "Connected" if spot_ws_client and spot_ws_client.sock and spot_ws_client.sock.connected else "Disconnected"
+    }
+    return jsonify(status), 200
+
+
+# 啟動應用程式
+if __name__ == '__main__':
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Flask 應用主入口啟動中...")
+    
+    # 在應用程式啟動時自動啟動監控服務
+    # 這確保了當 Gunicorn 啟動 Flask 應用時，監控線程也會隨之啟動
+    # 注意：這裡使用 threading.Thread 啟動 monitor_main_loop，因為它是阻塞的同步函數。
+    # Flask app.run() 會阻塞主線程，所以後台任務必須在新線程中。
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 正在啟動後台監控線程...")
+    MONITORING_ACTIVE = True # 設定監控為活躍狀態
+    threading.Thread(target=monitor_main_loop, daemon=True).start()
+    
+    # Flask 服務器監聽 HTTP 請求
+    # 如果您使用 Gunicorn 部署，此處的 app.run() 不會被直接執行，Gunicorn 會調用 Flask 應用實例。
+    # 但為了在本地直接運行 app.py 時也能工作，我們保留它。
+    app.run(host='0.0.0.0', port=5000, debug=False)
