@@ -49,25 +49,29 @@ ban_until = None
 def calculate_percentage_change(data_array, minutes):
     """
     計算數據陣列在指定分鐘內的百分比變動。
+    data_array: 包含 {timestamp, value} 字典的列表
+    minutes: 時間範圍（分鐘）。
+    返回值: 百分比變動，如果數據不足則返回 None。
     """
-    if not data_array or len(data_array) < 2:
+    if not data_array or len(data_array) < 2: # 確保至少有兩個數據點
         return None
 
     now = datetime.now(pytz.utc)
     cutoff_time = now - timedelta(minutes=minutes)
 
     old_val = None
+    # 找到最接近或早於截止時間的數據點
     for item in reversed(data_array):
         if item['timestamp'] <= cutoff_time:
             old_val = item['value']
             break
     
-    if old_val is None: # 如果找不到足夠舊的數據點
+    if old_val is None: # 如果沒有找到足夠舊的數據點
         return None
 
-    new_val = data_array[-1]['value']
+    new_val = data_array[-1]['value'] # 獲取最新的數據點的值
 
-    if new_val is None or old_val == 0:
+    if new_val is None or old_val == 0: # 避免除以零或新值為空
         return None
 
     return ((new_val - old_val) / old_val) * 100
@@ -105,7 +109,7 @@ def format_pct_or_na(value):
         return 'N/A'
     return f"{value:.2f}%"
 
-# 簡化 Telegram 訊息發送的 print
+
 async def send_telegram_alert(message):
     """
     透過 Telegram Bot 發送訊息。
@@ -118,17 +122,17 @@ async def send_telegram_alert(message):
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': message,
-        'parse_mode': 'HTML' 
+        'parse_mode': 'HTML' # 使用 HTML 模式，以便發送粗體、換行等格式
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status() 
+        response = requests.post(url, json=payload, timeout=10) # 設置10秒超時
+        response.raise_for_status() # 如果響應狀態碼是 4xx 或 5xx，則拋出 HTTPError 異常
         # print(f"DEBUG: Telegram 訊息發送成功: {message.splitlines()[0]}") # 減少重複日誌
     except requests.exceptions.HTTPError as e:
         print(f"ERROR: 發送 Telegram 訊息失敗: HTTP 錯誤 {e.response.status_code} - {e.response.text}")
     except requests.exceptions.RequestException as e:
         print(f"ERROR: 發送 Telegram 訊息失敗: 網路錯誤 - {e}")
-    except Exception as e:
+    except Exception as e: # 捕捉其他任何可能的錯誤
         print(f"CRITICAL: 發送 Telegram 訊息時發生未知錯誤: {e}")
 
 
@@ -139,7 +143,7 @@ def retry_fetch(url, retries=3, delay=1):
     global is_ip_banned, ban_until 
     for i in range(retries):
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10) # 10秒超時
             response.raise_for_status() 
             is_ip_banned = False 
             ban_until = None
