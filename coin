@@ -3,415 +3,307 @@ import time
 import requests
 import json
 import math
+import re
+import asyncio
+import threading
 from datetime import datetime, timedelta
-import pytz # 用於處理時區
-import re # 用於正規表達式
-import asyncio # 用於非同步操作
+import pytz 
+
+from flask import Flask, jsonify, render_template
 
 # --- 配置區塊 ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '6005276002:AAGN9u1k7xEmfwpe6nkJqhOPjsEwGttJGzM')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '-4946614597')
 
-# 幣安 API 端點 (通常不需要修改)
+# 幣安 API 端點
 BINANCE_FUTURES_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_OPEN_INTEREST_URL = "https://fapi.binance.com/fapi/v1/openInterest"
-BINANCE_SPOT_MINITICKER_URL = "https://api.binance.com/api/v3/ticker/24hr" 
+BINANCE_SPOT_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr" 
 
-# 價格變動評級閾值 (不變)
-PRICE_TIERS = [
-    {"threshold": 5.0, "rating": "⭐⭐⭐⭐"},
-    {"threshold": 4.0, "rating": "⭐⭐⭐"},
-    {"threshold": 3.0, "rating": "⭐⭐"},
-    {"threshold": 2.0, "rating": "⭐"}
-]
-
-# 持倉量變動評級閾值 (不變)
-OI_TIERS = [
-    {"threshold": 5.0, "rating": "🔥🔥🔥🔥"},
-    {"threshold": 3.5, "rating": "🔥🔥🔥"},
-    {"threshold": 3.0, "rating": "🔥🔥"},
-    {"threshold": 2.5, "rating": "🔥"}
-]
+# 警報閾值 (從你的網頁版程式碼中提取)
+PRICE_ALERT_THRESHOLD = 2.0  
+OI_ALERT_THRESHOLD = 2.5     
 
 # 警報冷卻時間 (分鐘)
 ALERT_COOLDOWN_MINUTES = 5
 
-# 數據儲存 (結構不變)
-history_data = {}
+# --- 全域數據儲存 (由後台任務更新，由 API 讀取) ---
+monitored_data = {} 
 monitored_symbols = [] 
-
-# IP 封鎖狀態追蹤
 is_ip_banned = False
 ban_until = None 
+alerts_to_display = [] # 用於記錄發送到 Telegram 的警報，方便 API 查詢
 
 # --- 輔助函數 ---
 
+def get_utc_now():
+    return datetime.now(pytz.utc)
+
 def calculate_percentage_change(data_array, minutes):
-    """
-    計算數據陣列在指定分鐘內的百分比變動。
-    data_array: 包含 {timestamp, value} 字典的列表
-    minutes: 時間範圍（分鐘）。
-    返回值: 百分比變動，如果數據不足則返回 None。
-    """
-    if not data_array or len(data_array) < 2: # 確保至少有兩個數據點
+    if not data_array or len(data_array) < 2: 
         return None
-
-    now = datetime.now(pytz.utc)
-    cutoff_time = now - timedelta(minutes=minutes)
-
+    cutoff_time = get_utc_now() - timedelta(minutes=minutes)
     old_val = None
-    # 找到最接近或早於截止時間的數據點
     for item in reversed(data_array):
         if item['timestamp'] <= cutoff_time:
             old_val = item['value']
             break
-    
-    if old_val is None: # 如果沒有找到足夠舊的數據點
+    if old_val is None or old_val == 0:
         return None
-
-    new_val = data_array[-1]['value'] # 獲取最新的數據點的值
-
-    if new_val is None or old_val == 0: # 避免除以零或新值為空
+    new_val = data_array[-1]['value']
+    if new_val is None:
         return None
-
     return ((new_val - old_val) / old_val) * 100
 
-def get_rating_info(value, tiers):
-    """
-    根據值和定義的評級層級獲取評級符號。
-    """
-    abs_value = abs(value)
-    for tier in tiers:
-        if abs_value >= tier["threshold"]:
-            return tier["rating"]
-    return ""
-
-def format_large_number(num):
-    """
-    將大數字格式化為帶有 K/M/B 單位和兩位小數的字串。
-    """
-    if num is None or math.isnan(num):
-        return 'N/A'
-    if num >= 1_000_000_000:
-        return f"{(num / 1_000_000_000):.2f}B"
-    elif num >= 1_000_000:
-        return f"{(num / 1_000_000):.2f}M" # 已修正：這裡不再有多餘的'f'
-    elif num >= 1_000:
-        return f"{(num / 1_000):.2f}K"
-    else:
-        return f"{num:.2f}"
-
 def format_pct_or_na(value):
-    """
-    將數字格式化為帶有兩位小數的百分比字串，如果為 None 或 NaN 則返回 'N/A'。
-    """
     if value is None or math.isnan(value):
         return 'N/A'
     return f"{value:.2f}%"
 
-
 async def send_telegram_alert(message):
-    """
-    透過 Telegram Bot 發送訊息。
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram BOT_TOKEN 或 CHAT_ID 未配置。無法發送訊息。")
+        app.logger.error("Telegram BOT_TOKEN 或 CHAT_ID 未配置。無法發送訊息。")
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'HTML' # 使用 HTML 模式，以便發送粗體、換行等格式
-    }
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
     try:
-        response = requests.post(url, json=payload, timeout=10) # 設置10秒超時
-        response.raise_for_status() # 如果響應狀態碼是 4xx 或 5xx，則拋出 HTTPError 異常
-        # print(f"DEBUG: Telegram 訊息發送成功: {message.splitlines()[0]}") # 減少重複日誌
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status() 
+        app.logger.info(f"Telegram 訊息發送成功: {message.splitlines()[0]}")
+        
+        # 將警報存儲到列表，以便前端調用
+        alerts_to_display.append({
+            'message': message,
+            'timestamp': get_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        })
+        if len(alerts_to_display) > 20: # 只保留最近20條警報
+            alerts_to_display.pop(0)
+
     except requests.exceptions.HTTPError as e:
-        print(f"ERROR: 發送 Telegram 訊息失敗: HTTP 錯誤 {e.response.status_code} - {e.response.text}")
+        app.logger.error(f"發送 Telegram 訊息失敗: HTTP 錯誤 {e.response.status_code} - {e.response.text}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: 發送 Telegram 訊息失敗: 網路錯誤 - {e}")
-    except Exception as e: # 捕捉其他任何可能的錯誤
-        print(f"CRITICAL: 發送 Telegram 訊息時發生未知錯誤: {e}")
+        app.logger.error(f"發送 Telegram 訊息失敗: 網路錯誤 - {e}")
+    except Exception as e:
+        app.logger.critical(f"發送 Telegram 訊息時發生未知錯誤: {e}")
 
-
-def retry_fetch(url, retries=3, delay=1):
-    """
-    帶有重試邏輯的 fetch 請求，並處理幣安的 IP 封鎖。
-    """
+async def retry_fetch(url, retries=3, delay=1):
     global is_ip_banned, ban_until 
     for i in range(retries):
         try:
-            response = requests.get(url, timeout=10) # 10秒超時
+            response = requests.get(url, timeout=10)
             response.raise_for_status() 
             is_ip_banned = False 
             ban_until = None
             return response.json()
         except requests.exceptions.HTTPError as e:
             error_text = e.response.text
-            print(f"WARNING: 第 {i + 1} 次獲取失敗: {url}, Status: {e.response.status_code}")
-
+            app.logger.warning(f"第 {i + 1} 次獲取失敗: {url}, Status: {e.response.status_code}")
             if e.response.status_code in [418, 429] or ("-1003" in error_text and "banned" in error_text):
                 is_ip_banned = True
                 ban_match = re.search(r"banned until (\d+)", error_text)
                 if ban_match:
                     ban_timestamp_ms = int(ban_match.group(1))
                     ban_until = datetime.fromtimestamp(ban_timestamp_ms / 1000, tz=pytz.utc)
-                    print(f"CRITICAL: IP 已被幣安封鎖，直到: {ban_until.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    app.logger.critical(f"IP 已被幣安封鎖，直到: {ban_until.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 else:
-                    ban_until = datetime.now(pytz.utc) + timedelta(minutes=5)
-                    print("CRITICAL: IP 已被幣安封鎖 (未提供具體時間)，假定封鎖 5 分鐘。")
-
+                    ban_until = get_utc_now() + timedelta(minutes=5)
+                    app.logger.critical("IP 已被幣安封鎖 (未提供具體時間)，假定封鎖 5 分鐘。")
                 raise Exception(f"IP BANNED: {error_text}")
             else:
                 if i < retries - 1:
                     wait_time = delay * (2 ** i)
-                    print(f"INFO: 將在 {wait_time} 秒後重試...")
-                    time.sleep(wait_time)
+                    app.logger.info(f"將在 {wait_time} 秒後重試...")
+                    await asyncio.sleep(wait_time)
                 else:
                     raise e 
         except requests.exceptions.RequestException as e:
-            print(f"ERROR: 第 {i + 1} 次獲取網路錯誤: {url}: {e}")
+            app.logger.error(f"第 {i + 1} 次獲取網路錯誤: {url}: {e}")
             if i < retries - 1:
                 wait_time = delay * (2 ** i)
-                print(f"INFO: 將在 {wait_time} 秒後重試...")
-                time.sleep(wait_time)
+                app.logger.info(f"將在 {wait_time} 秒後重試...")
+                await asyncio.sleep(wait_time)
             else:
                 raise e
-
     raise Exception(f"CRITICAL: 在 {retries} 次重試後，仍無法獲取 {url}。")
 
-# --- 數據獲取和處理 ---
 
-def initialize_monitoring_symbols():
-    """
-    動態獲取並設定要監控的交易對列表。
-    """
-    global monitored_symbols, history_data, is_ip_banned, ban_until
-
-    print("INFO: 正在獲取可監控的期貨交易對列表...")
-    if is_ip_banned and ban_until and datetime.now(pytz.utc) < ban_until:
-        remaining_time = (ban_until - datetime.now(pytz.utc)).total_seconds()
-        print(f"WARNING: IP 仍然被封鎖，剩餘 {remaining_time:.0f} 秒。跳過交易對初始化。")
+async def initialize_monitoring_symbols():
+    global monitored_symbols, monitored_data, is_ip_banned, ban_until
+    app.logger.info("正在獲取可監控的期貨交易對列表...")
+    if is_ip_banned and ban_until and get_utc_now() < ban_until:
         return False
-
     is_ip_banned = False
-
     try:
-        response_data = retry_fetch(BINANCE_FUTURES_EXCHANGE_INFO_URL)
-        valid_symbols = [
-            s['symbol'].replace('USDT', '/USDT')
-            for s in response_data['symbols']
-            if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING'
-        ]
-
+        response_data = await retry_fetch(BINANCE_FUTURES_EXCHANGE_INFO_URL)
+        valid_symbols = [s['symbol'].replace('USDT', '/USDT') for s in response_data['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING']
         monitored_symbols = valid_symbols
-
-        new_history_data = {}
+        new_monitored_data = {}
         for symbol in monitored_symbols:
-            if symbol in history_data:
-                new_history_data[symbol] = history_data[symbol]
+            if symbol in monitored_data: 
+                new_monitored_data[symbol] = monitored_data[symbol]
             else:
-                new_history_data[symbol] = {
-                    'spot': [],
-                    'futures': [],
-                    'last_alert_time': None,
-                    'first_alert_time': None,
-                    'subsequent_alert_times': []
+                new_monitored_data[symbol] = {
+                    'spot_history': [], 'futures_history': [], 
+                    'last_alert_time': None, 'first_alert_time': None, 'subsequent_alert_times': [],
+                    'latest_price': None, 'latest_oi': None, 
+                    'price_changes': {'1m': 'N/A', '5m': 'N/A', '15m': 'N/A'},
+                    'oi_changes': {'1m': 'N/A', '5m': 'N/A', '15m': 'N/A'}
                 }
-        history_data = new_history_data
-
-        print(f"INFO: 已載入 {len(monitored_symbols)} 個期貨交易對。")
+        monitored_data = new_monitored_data
+        app.logger.info(f"已載入 {len(monitored_symbols)} 個期貨交易對。")
         if not monitored_symbols:
-            print("WARNING: 沒有找到可監控的交易對。")
+            app.logger.warning("沒有找到可監控的交易對。")
             return False
         return True
-
     except Exception as e:
-        print(f"ERROR: 獲取期貨交易對列表失敗: {e}")
+        app.logger.error(f"獲取期貨交易對列表失敗: {e}")
         return False
 
-def fetch_spot_prices():
-    """
-    獲取所有監控交易對的當前現貨價格。
-    """
-    global history_data
-    if is_ip_banned and ban_until and datetime.now(pytz.utc) < ban_until:
+async def fetch_spot_prices():
+    global monitored_data
+    if is_ip_banned and ban_until and get_utc_now() < ban_until:
         return
-
     try:
-        all_tickers = retry_fetch(BINANCE_SPOT_MINITICKER_URL)
-        now = datetime.now(pytz.utc)
-
+        all_tickers = await retry_fetch(BINANCE_SPOT_TICKER_URL)
+        now = get_utc_now()
         for ticker in all_tickers:
             symbol_raw = ticker['symbol']
             formatted_symbol = symbol_raw.replace('USDT', '/USDT')
             price = float(ticker['lastPrice'])
-
-            if formatted_symbol in monitored_symbols:
-                if formatted_symbol not in history_data:
-                    history_data[formatted_symbol] = {'spot': [], 'futures': [], 'last_alert_time': None, 'first_alert_time': None, 'subsequent_alert_times': []}
-                history_data[formatted_symbol]['spot'].append({'timestamp': now, 'value': price})
-
+            if formatted_symbol in monitored_data:
+                monitored_data[formatted_symbol]['latest_price'] = price
+                monitored_data[formatted_symbol]['spot_history'].append({'timestamp': now, 'value': price})
                 cutoff = now - timedelta(minutes=16)
-                while history_data[formatted_symbol]['spot'] and history_data[formatted_symbol]['spot'][0]['timestamp'] < cutoff:
-                    history_data[formatted_symbol]['spot'].pop(0)
-
+                while monitored_data[formatted_symbol]['spot_history'] and monitored_data[formatted_symbol]['spot_history'][0]['timestamp'] < cutoff:
+                    monitored_data[formatted_symbol]['spot_history'].pop(0)
     except Exception as e:
-        print(f"ERROR: 獲取現貨價格失敗: {e}")
+        app.logger.error(f"獲取現貨價格失敗: {e}")
 
-
-def fetch_open_interest_rest():
-    """
-    獲取每個監控交易對的期貨持倉量數據。
-    """
-    global history_data
-    if is_ip_banned and ban_until and datetime.now(pytz.utc) < ban_until:
+async def fetch_open_interest_rest():
+    global monitored_data
+    if is_ip_banned and ban_until and get_utc_now() < ban_until:
         return
-
     delay_between_requests = 0.5 
-
     for symbol in list(monitored_symbols):
         binance_symbol = symbol.replace('/', '')
         url = f"{BINANCE_FUTURES_OPEN_INTEREST_URL}?symbol={binance_symbol}"
         try:
-            data = retry_fetch(url)
+            data = await retry_fetch(url)
             open_interest = float(data['openInterest'])
-            now = datetime.now(pytz.utc)
-
-            if symbol not in history_data:
-                history_data[symbol] = {'spot': [], 'futures': [], 'last_alert_time': None, 'first_alert_time': None, 'subsequent_alert_times': []}
-            history_data[symbol]['futures'].append({'timestamp': now, 'value': open_interest})
-
-            cutoff = now - timedelta(minutes=16)
-            while history_data[symbol]['futures'] and history_data[symbol]['futures'][0]['timestamp'] < cutoff:
-                history_data[symbol]['futures'].pop(0)
-
+            now = get_utc_now()
+            if symbol in monitored_data:
+                monitored_data[symbol]['latest_oi'] = open_interest
+                monitored_data[symbol]['futures_history'].append({'timestamp': now, 'value': open_interest})
+                cutoff = now - timedelta(minutes=16)
+                while monitored_data[symbol]['futures_history'] and monitored_data[symbol]['futures_history'][0]['timestamp'] < cutoff:
+                    monitored_data[symbol]['futures_history'].pop(0)
         except Exception as e:
-            print(f"ERROR: 獲取 {symbol} 持倉量失敗: {e}")
+            app.logger.error(f"獲取 {symbol} 持倉量失敗: {e}")
             if "IP BANNED" in str(e):
                 return
             if "-4108" in str(e) and "Symbol is on delivering" in str(e):
-                print(f"WARNING: 交易對 {symbol} 狀態無效，將從監控列表中移除。")
+                app.logger.warning(f"交易對 {symbol} 狀態無效，將從監控列表中移除。")
                 monitored_symbols.remove(symbol)
-                if symbol in history_data:
-                    del history_data[symbol]
+                if symbol in monitored_data:
+                    del monitored_data[symbol]
         finally:
-            time.sleep(delay_between_requests)
+            await asyncio.sleep(delay_between_requests)
 
-def check_and_send_alerts():
-    """
-    檢查是否有顯著的價格/持倉量變動，並發送 Telegram 警報。
-    """
-    global history_data
-    now = datetime.now(pytz.utc)
-
+async def check_and_send_alerts():
+    global monitored_data
+    now = get_utc_now()
     for symbol in list(monitored_symbols):
-        if symbol not in history_data:
+        if symbol not in monitored_data or 'spot_history' not in monitored_data[symbol] or 'futures_history' not in monitored_data[symbol]:
             continue
+        data_entry = monitored_data[symbol]
+        spot_hist = data_entry['spot_history']
+        fut_hist = data_entry['futures_history']
 
-        spot_hist = history_data[symbol]['spot']
-        fut_hist = history_data[symbol]['futures']
+        p_change_1m = calculate_percentage_change(spot_hist, 1)
+        p_change_5m = calculate_percentage_change(spot_hist, 5)
+        p_change_15m = calculate_percentage_change(spot_hist, 15)
+        data_entry['price_changes'] = {'1m': p_change_1m, '5m': p_change_5m, '15m': p_change_15m}
 
-        p1 = calculate_percentage_change(spot_hist, 1)
-        p5 = calculate_percentage_change(spot_hist, 5)
-        p15 = calculate_percentage_change(spot_hist, 15)
+        oi_change_1m = calculate_percentage_change(fut_hist, 1)
+        oi_change_5m = calculate_percentage_change(fut_hist, 5)
+        oi_change_15m = calculate_percentage_change(fut_hist, 15)
+        data_entry['oi_changes'] = {'1m': oi_change_1m, '5m': oi_change_5m, '15m': oi_change_15m}
 
-        o1 = calculate_percentage_change(fut_hist, 1)
-        o5 = calculate_percentage_change(fut_hist, 5)
-        o15 = calculate_percentage_change(fut_hist, 15)
+        price_alert_triggered = False
+        if (p_change_1m is not None and abs(p_change_1m) >= PRICE_ALERT_THRESHOLD) or \
+           (p_change_5m is not None and abs(p_change_5m) >= PRICE_ALERT_THRESHOLD) or \
+           (p_change_15m is not None and abs(p_change_15m) >= PRICE_ALERT_THRESHOLD):
+            price_alert_triggered = True
 
-        price_rating = get_rating_info(max(abs(p1) if p1 is not None else 0, abs(p5) if p5 is not None else 0, abs(p15) if p15 is not None else 0), PRICE_TIERS)
-        oi_rating = get_rating_info(max(abs(o1) if o1 is not None else 0, abs(o5) if o5 is not None else 0, abs(o15) if o15 is not None else 0), OI_TIERS)
+        oi_alert_triggered = False
+        if (oi_change_1m is not None and abs(oi_change_1m) >= OI_ALERT_THRESHOLD) or \
+           (oi_change_5m is not None and abs(oi_change_5m) >= OI_ALERT_THRESHOLD) or \
+           (oi_change_15m is not None and abs(oi_change_15m) >= OI_ALERT_THRESHOLD):
+            oi_alert_triggered = True
 
-        price_alert_threshold_met = (
-            (p1 is not None and abs(p1) >= PRICE_TIERS[-1]["threshold"]) or
-            (p5 is not None and abs(p5) >= PRICE_TIERS[-1]["threshold"]) or
-            (p15 is not None and abs(p15) >= PRICE_TIERS[-1]["threshold"])
-        )
-
-        oi_alert_threshold_met = (
-            (o1 is not None and abs(o1) >= OI_TIERS[-1]["threshold"]) or
-            (o5 is not None and abs(o5) >= OI_TIERS[-1]["threshold"]) or
-            (o15 is not None and abs(o15) >= OI_TIERS[-1]["threshold"])
-        )
-
-        last_alert_time = history_data[symbol]['last_alert_time']
+        if not (price_alert_triggered or oi_alert_triggered):
+            continue
+        
+        last_alert_time = data_entry['last_alert_time']
         if last_alert_time and (now - last_alert_time).total_seconds() / 60 < ALERT_COOLDOWN_MINUTES:
+            app.logger.info(f"符號 #{symbol} 仍在冷卻中 ({ALERT_COOLDOWN_MINUTES}分鐘)，跳過本次 Telegram 警報。")
             continue
 
         alert_message_parts = []
-        is_alert_triggered = False
+        
+        if price_alert_triggered:
+            price_msg = f"📈 <b>價格異動 - #{symbol}:</b>\n"
+            price_msg += f"• 1m: {format_pct_or_na(p_change_1m)} | "
+            price_msg += f"5m: {format_pct_or_na(p_change_5m)} | "
+            price_msg += f"15m: {format_pct_or_na(p_change_15m)}"
+            alert_message_parts.append(price_msg)
 
-        if price_alert_threshold_met:
-            price_alert_message = (
-                f"📈 <b>價格異動 {price_rating}評級 - #{symbol}:</b>\n"
-                f"• 1m: {format_pct_or_na(p1)} | 5m: {format_pct_or_na(p5)} | 15m: {format_pct_or_na(p15)}"
-            )
-            alert_message_parts.append(price_alert_message)
-            is_alert_triggered = True
-
-        if oi_alert_threshold_met:
+        if oi_alert_triggered:
             note = ""
             has_bearish_oi_increase = False
-            if p1 is not None and o1 is not None and p1 < 0 and o1 > 0:
+            if (p_change_1m is not None and oi_change_1m is not None and p_change_1m < 0 and oi_change_1m > 0) or \
+               (p_change_5m is not None and oi_change_5m is not None and p_change_5m < 0 and oi_change_5m > 0) or \
+               (p_change_15m is not None and oi_change_15m is not None and p_change_15m < 0 and oi_change_15m > 0):
                 has_bearish_oi_increase = True
-            if p5 is not None and o5 is not None and p5 < 0 and o5 > 0:
-                has_bearish_oi_increase = True
-            if p15 is not None and o15 is not None and p15 < 0 and o15 > 0:
-                has_bearish_oi_increase = True
-
             if has_bearish_oi_increase:
                 note = " ⚠️疑是空方進場"
 
-            oi_alert_message = (
-                f"💹 <b>持倉異動 {oi_rating}{note} - #{symbol}:</b>\n"
-                f"• 1m: {format_pct_or_na(o1)} | 5m: {format_pct_or_na(o5)} | 15m: {format_pct_or_na(o15)}"
-            )
-            alert_message_parts.append(oi_alert_message)
-            is_alert_triggered = True
+            oi_msg = f"💹 <b>持倉異動{note} - #{symbol}:</b>\n"
+            oi_msg += f"• 1m: {format_pct_or_na(oi_change_1m)} | "
+            oi_msg += f"5m: {format_pct_or_na(oi_change_5m)} | "
+            oi_msg += f"15m: {format_pct_or_na(oi_change_15m)}"
+            alert_message_parts.append(oi_msg)
         
-        if is_alert_triggered:
-            if history_data[symbol]['first_alert_time'] is None:
-                history_data[symbol]['first_alert_time'] = now
-                history_data[symbol]['subsequent_alert_times'] = []
-            else:
-                history_data[symbol]['subsequent_alert_times'].append(now)
+        if data_entry['first_alert_time'] is None:
+            data_entry['first_alert_time'] = now
+            data_entry['subsequent_alert_times'] = []
+        else:
+            data_entry['subsequent_alert_times'].append(now)
 
-            # 簡化時間戳格式，避免中文
-            first_alert_str = history_data[symbol]['first_alert_time'].strftime("%Y-%m-%d %H:%M:%S UTC")
-            timestamp_info = f"\n首次觸發時間: {first_alert_str}"
-            
-            if history_data[symbol]['subsequent_alert_times']:
-                last_subsequent_str = history_data[symbol]['subsequent_alert_times'][-1].strftime("%Y-%m-%d %H:%M:%S UTC")
-                timestamp_info += f"\n上次觸發時間: {last_subsequent_str}"
+        first_alert_str = data_entry['first_alert_time'].strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp_info = f"\n首次觸發時間: {first_alert_str}"
+        if data_entry['subsequent_alert_times']:
+            last_subsequent_str = data_entry['subsequent_alert_times'][-1].strftime("%Y-%m-%d %H:%M:%S UTC")
+            timestamp_info += f"\n上次觸發時間: {last_subsequent_str}"
 
-            final_alert_message = "\n\n".join(alert_message_parts) + timestamp_info
-            
-            asyncio.run(send_telegram_alert(final_alert_message))
-            history_data[symbol]['last_alert_time'] = now
+        final_alert_message = "\n\n".join(alert_message_parts) + timestamp_info
+        
+        await send_telegram_alert(final_alert_message)
+        data_entry['last_alert_time'] = now
 
-# --- 主應用程式循環 ---
-
-async def main_loop():
-    """
-    主要循環，負責獲取數據和檢查警報。
-    """
-    global is_ip_banned, ban_until
-
+async def main_task():
+    app.logger.info("後台監控任務已啟動！")
     start_message = "Ashdata掃鏈程式已啟動！正在初始化交易對列表..."
-    print(f"INFO: 嘗試發送啟動訊息: {start_message}")
     try:
         await send_telegram_alert(start_message)
     except Exception as e:
-        print(f"ERROR: 啟動訊息發送失敗: {e}")
+        app.logger.error(f"啟動訊息發送失敗: {e}")
 
     init_success = False
     while not init_success:
-        init_success = initialize_monitoring_symbols()
+        init_success = await initialize_monitoring_symbols()
         if not init_success:
-            print("WARNING: 初始化交易對失敗。將在 60 秒後重試...")
+            app.logger.warning("初始化交易對失敗。將在 60 秒後重試...")
             try:
                 await send_telegram_alert("⚠️ 錯誤：Ashdata掃鏈初始化失敗，正在重試。")
             except:
@@ -419,30 +311,29 @@ async def main_loop():
             await asyncio.sleep(60)
 
     startup_complete_message = f"Ashdata掃鏈已偵測到 <b>{len(monitored_symbols)}</b> 種標的。監控服務正式啟動！"
-    print(f"INFO: 嘗試發送啟動完成訊息: {startup_complete_message}")
     try:
         await send_telegram_alert(startup_complete_message)
     except Exception as e:
-        print(f"ERROR: 啟動完成訊息發送失敗: {e}")
+        app.logger.error(f"啟動完成訊息發送失敗: {e}")
 
     while True:
         if is_ip_banned:
-            if ban_until and datetime.now(pytz.utc) < ban_until:
-                remaining_time = (ban_until - datetime.now(pytz.utc)).total_seconds()
-                print(f"WARNING: IP 仍然被封鎖。將等待 {remaining_time:.0f} 秒後重試所有數據獲取。")
+            if ban_until and get_utc_now() < ban_until:
+                remaining_time = (ban_until - get_utc_now()).total_seconds()
+                app.logger.warning(f"IP 仍然被封鎖。將等待 {remainingTime:.0f} 秒後檢查是否解除封鎖...")
                 try:
-                    await send_telegram_alert(f"⚠️ 警報：Ashdata掃鏈IP已被幣安暫時封鎖，剩餘約 {remaining_time:.0f} 秒。")
+                    await send_telegram_alert(f"⚠️ 警報：Ashdata掃鏈IP已被幣安暫時封鎖，剩餘約 {remainingTime:.0f} 秒。")
                 except:
                     pass
-                await asyncio.sleep(max(10, remaining_time + 5))
+                await asyncio.sleep(max(10, remainingTime + 5))
                 continue
             else:
-                print("INFO: IP 封鎖可能已解除。正在嘗試清除封鎖狀態並重新初始化。")
+                app.logger.info("IP 封鎖可能已解除。正在嘗試清除封鎖狀態並重新初始化。")
                 is_ip_banned = False
                 ban_until = None
-                init_success = initialize_monitoring_symbols()
+                init_success = await initialize_monitoring_symbols()
                 if not init_success:
-                    print("WARNING: 解除封鎖後的重新初始化失敗。將在 60 秒後重試...")
+                    app.logger.warning("解除封鎖後的重新初始化失敗。將在 60 秒後重試...")
                     try:
                         await send_telegram_alert("⚠️ 錯誤：Ashdata掃鏈解除IP封鎖後初始化失敗，正在重試。")
                     except:
@@ -450,21 +341,48 @@ async def main_loop():
                     await asyncio.sleep(60)
                     continue
 
-        print("INFO: 開始獲取現貨價格和期貨持倉量...")
-        fetch_spot_prices()
-        fetch_open_interest_rest()
-        print("INFO: 完成數據獲取。")
+        app.logger.info("開始獲取現貨價格和期貨持倉量...")
+        await fetch_spot_prices()
+        await fetch_open_interest_rest()
+        app.logger.info("完成數據獲取。")
 
-        print("INFO: 檢查並發送警報...")
-        check_and_send_alerts()
-        print("INFO: 警報檢查完成。")
+        app.logger.info("檢查並發送警報...")
+        await check_and_send_alerts()
+        app.logger.info("警報檢查完成。")
 
         min_fetch_interval = 60
         calculated_fetch_interval = len(monitored_symbols) * 0.5 + 10
         next_interval = max(min_fetch_interval, calculated_fetch_interval)
         
-        print(f"INFO: 下一次數據獲取和警報檢查將在 {next_interval:.0f} 秒後進行...")
+        app.logger.info(f"下一次數據獲取和警報檢查將在 {next_interval:.0f} 秒後進行...")
         await asyncio.sleep(next_interval)
 
-if __name__ == "__main__":
-    asyncio.run(main_loop())
+# --- Flask 應用初始化 ---
+app = Flask(__name__)
+
+# --- Flask 路由 ---
+@app.route('/')
+def index():
+    return "<p>監視服務正在後台運行。請檢查您的 Telegram。</p>"
+
+@app.route('/api/status')
+def get_status():
+    if is_ip_banned:
+        return jsonify({'status': 'error', 'message': f"IP 已被幣安暫時封鎖，直到 {ban_until.strftime('%Y-%m-%d %H:%M:%S UTC')}。"})
+    elif not monitored_symbols:
+        return jsonify({'status': 'warning', 'message': '未找到可監控的交易對或初始化失敗。'})
+    else:
+        return jsonify({'status': 'success', 'message': f"監控服務正在運行中，已載入 {len(monitored_symbols)} 個交易對。"})
+
+@app.route('/api/alerts')
+def get_alerts():
+    return jsonify(alerts_to_display)
+
+# --- 啟動後台任務 ---
+def start_monitoring_in_thread():
+    asyncio.run(main_task())
+
+# Flask 應用啟動時啟動後台任務
+if __name__ == '__main__':
+    threading.Thread(target=start_monitoring_in_thread, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)
